@@ -1,0 +1,13 @@
+.env
+config/credentials.yaml
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+logs/
+*.log

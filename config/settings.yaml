@@ -1,0 +1,62 @@
+# All configurable parameters for regime-trader.
+# Values here are defaults; override via config/credentials.yaml (secrets only)
+# or environment variables where noted in .env.example.
+
+broker:
+  paper_trading: true                # Trade against Alpaca's paper endpoint
+  symbols:                           # Universe traded by the strategy
+    - SPY
+    - QQQ
+    - AAPL
+    - MSFT
+    - AMZN
+    - GOOGL
+    - NVDA
+    - META
+    - TSLA
+    - AMD
+  timeframe: "1Day"                  # Bar timeframe for signal generation
+
+hmm:
+  n_candidates: [3, 4, 5, 6, 7]      # Candidate hidden-state counts to search over
+  n_init: 10                        # Random restarts per candidate during model fitting
+  covariance_type: "full"           # HMM emission covariance structure
+  min_train_bars: 252               # Minimum history required before fitting (~1 trading year)
+  stability_bars: 3                 # Bars a regime must persist before being considered "confirmed"
+  flicker_window: 20                # Lookback window used to detect regime flicker
+  flicker_threshold: 4              # Max regime switches allowed within flicker_window
+  min_confidence: 0.55              # Minimum posterior probability to act on a regime call
+
+strategy:
+  low_vol_allocation: 0.95          # Target allocation in a low-volatility regime
+  mid_vol_allocation_trend: 0.95    # Target allocation in a mid-vol regime while trending
+  mid_vol_allocation_no_trend: 0.60 # Target allocation in a mid-vol regime while non-trending
+  high_vol_allocation: 0.60         # Target allocation in a high-volatility regime
+  low_vol_leverage: 1.25            # Max leverage permitted only in the low-vol regime
+  rebalance_threshold: 0.10         # Minimum allocation drift required to trigger a rebalance
+  uncertainty_size_mult: 0.50       # Position-size multiplier applied when regime confidence is low
+
+risk:
+  max_risk_per_trade: 0.01          # Max fraction of equity risked on a single trade
+  max_exposure: 0.80                # Max aggregate exposure as a fraction of equity
+  max_leverage: 1.25                # Hard ceiling on account leverage
+  max_single_position: 0.15         # Max allocation to any single symbol
+  max_concurrent: 5                 # Max number of concurrently open positions
+  max_daily_trades: 20              # Max number of trades allowed per day
+  daily_dd_reduce: 0.02             # Daily drawdown at which exposure is reduced
+  daily_dd_halt: 0.03               # Daily drawdown at which trading is halted for the day
+  weekly_dd_reduce: 0.05            # Weekly drawdown at which exposure is reduced
+  weekly_dd_halt: 0.07              # Weekly drawdown at which trading is halted for the week
+  max_dd_from_peak: 0.10            # Max drawdown from equity peak before a full halt
+
+backtest:
+  slippage_pct: 0.0005              # Simulated slippage applied per fill
+  initial_capital: 100000           # Starting capital for backtests
+  train_window: 252                 # Walk-forward training window, in bars
+  test_window: 126                  # Walk-forward out-of-sample test window, in bars
+  step_size: 126                    # Step size between successive walk-forward windows
+  risk_free_rate: 0.045             # Annualized risk-free rate used in Sharpe calculations
+
+monitoring:
+  dashboard_refresh_seconds: 5      # Terminal dashboard refresh interval
+  alert_rate_limit_minutes: 15      # Minimum minutes between repeat alerts of the same type

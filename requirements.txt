@@ -1,0 +1,12 @@
+hmmlearn
+alpaca-py
+pandas
+numpy
+scipy
+ta
+scikit-learn
+pyyaml
+python-dotenv
+websocket-client
+schedule
+rich
