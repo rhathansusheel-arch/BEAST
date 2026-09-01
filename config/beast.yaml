@@ -1,0 +1,150 @@
+# Beast — Appendix A config block.
+#
+# THIS FILE IS THE ONLY PLACE A THRESHOLD MAY BE A LITERAL.
+# Every value marked `# CONFIRM` is a `[DEFAULT — pending confirmation]` in the Soul File
+# (beast/soul/BEAST_SOUL_v3.md) and must not be duplicated anywhere else in the codebase.
+#
+# `null` in a blocker field means FAIL, not "no limit". Beast refuses to trade rather than
+# guess — see Soul File 5.7.3, 3.1 (Gold specs) and PRECEDENCE.md.
+
+indicators:
+  adx_period: 14            # CONFIRM
+  adx_trend_threshold: 20   # CONFIRM
+  stoch: {k: 14, smooth: 3, d: 3}          # CONFIRM
+  stoch_levels: {oversold: 20, overbought: 80}   # CONFIRM
+  macd: {fast: 12, slow: 26, signal: 9}    # CONFIRM
+  rsi_period: 14            # CONFIRM
+  rsi_levels: {oversold: 30, mid: 50, overbought: 70}  # CONFIRM
+  bb: {period: 20, stddev: 2.0}            # CONFIRM
+  atr_period: 14            # CONFIRM
+
+timeframes:
+  indian:  {bias: 15M, setup: 5M,  trigger: 1M}
+  gold:    {bias: 30M, setup: 15M, trigger: 1M}   # 30M gold-only — CONFIRM
+
+sessions:
+  indian:  {open: "09:15", close: "15:30", last_entry: "15:00", flatten_begin: "15:20", hard_flat: "15:25", opening_guard_min: 15}  # CONFIRM
+  gold:    {open: "05:00", close: "21:00", last_entry: "20:30", flatten_begin: "20:50", hard_flat: "20:55", opening_guard_min: 0}   # CONFIRM
+
+levels:
+  fractal_n: 2                    # CONFIRM
+  sr_cluster_atr: 0.15            # CONFIRM
+  sr_zone_width_atr: 0.25         # CONFIRM
+  trendline_min_touches: 3
+  trendline_max_dev_atr: 0.20     # CONFIRM
+  trendline_break_atr: 0.10       # CONFIRM
+  ob_zone_mode: body              # body | wick — CONFIRM
+  ob_fresh_retests: 1             # CONFIRM
+  ob_expiry: session              # session | 24h — CONFIRM
+  swing_lookback: 100             # 4.5 lookback window, candles
+  zone_dead_close_atr: 0.5        # 4.5 zone invalidation — close beyond by > 0.5 ATR
+  ob_impulse_candles: 3           # 4.5 impulse: >= 3 consecutive same-direction closes
+  ob_impulse_atr: 1.5             # 4.5 impulse: >= 1.5 ATR within 5 candles
+  ob_impulse_window: 5
+
+entry:
+  min_confluence: 4
+  min_confluence_counter_bias: 5  # CONFIRM
+  opposing_reject_count: 3        # CONFIRM
+  setup1_trigger_mode: break_close # break_close | retest — CONFIRM
+  setup1_momentum_atr: 1.2        # CONFIRM
+  setup4_max_retrace: 0.618       # CONFIRM
+  signal_validity_candles: 5      # CONFIRM
+  level_reentry_cap: 2            # CONFIRM
+  post_loss_cooldown_min: 15      # CONFIRM
+  news_blackout_min: {before: 15, after: 15}   # CONFIRM
+  range_regime_allowed_setups: [2, 3]          # CONFIRM
+  setup2_blowthrough_atr: 2.5     # 5.2 — arrival impulse > 2.5 ATR disqualifies
+  duplicate_suppression_atr: 0.25 # 5.5 — same entry within 0.25 ATR is a duplicate
+
+confluence:                       # 5.4 machine-checkable definitions
+  slope_lookback: 3               # "rising"/"falling": vs value 3 candles ago
+  slope_min_delta: 0.5            # difference must exceed 0.5 index points
+  fresh_crossover_bars: 3         # cross within the last 3 closed candles
+  near_level_atr: 0.5             # crossing candle body within 0.5 ATR of zone centre
+  histogram_expanding_bars: 2     # abs histogram up on each of the last 2 candles
+  band_walk_lookback: 3           # 2 of the last 3 closes beyond band +/- tolerance
+  band_walk_min: 2
+  band_walk_tolerance_atr: 0.1
+  vwap_hold_lookback: 5           # pullback held VWAP within the last 5 candles
+  vwap_hold_atr: 0.25
+  divergence_lookback: 20         # divergence vs prior confirmed swing within 20 candles
+
+exit:
+  target_r: 2.0                   # CONFIRM
+  target_infeasible_policy: reject   # reject | target_level_min_1.5R — CONFIRM
+  target_level_min_r: 1.5         # only used when policy is target_level_min_1.5R
+  stop_buffer_atr: 0.25           # CONFIRM
+  stop_min_atr: 0.5               # CONFIRM
+  stop_max_atr: 2.5               # CONFIRM
+  trail_activate_r: 1.0           # CONFIRM
+  trail_method: atr_chandelier    # atr_chandelier | structure_trail — CONFIRM
+  trail_atr_mult: 1.5             # CONFIRM
+  partial_exit_enabled: false     # CONFIRM
+  time_stop_enabled: false        # CONFIRM
+  time_stop_bars: 20              # CONFIRM
+  breakeven_cost_points: 0.0      # 6.3 breakeven + estimated costs, in underlying points
+
+instruments:
+  nifty:  {analyse: index_spot, trade: options, option_side: long_only, lot_size: null, strike_interval: null}   # CONFIRM
+  sensex: {analyse: index_spot, trade: options, option_side: long_only, lot_size: null, strike_interval: null}   # CONFIRM — options assumed, same as Nifty
+  gold:   {analyse: xauusd, trade: futures, venue: null, contract_multiplier: null, tick_size: null, tick_value: null, rollover_buffer_days: 3}  # CONFIRM — Beast refuses to size until populated
+
+options:
+  expiry_preference: nearest_weekly    # CONFIRM
+  target_delta: 0.55                   # CONFIRM
+  delta_band: [0.45, 0.65]             # CONFIRM
+  min_oi: null                         # CONFIRM — unset is treated as FAIL, not pass
+  min_volume: null                     # CONFIRM
+  min_premium: null                    # CONFIRM
+  max_spread_abs: 1.00                 # CONFIRM
+  max_spread_pct: 0.01                 # CONFIRM
+  premium_stop_pct: 0.35               # CONFIRM — exit at 65% of entry premium
+  max_premium_outlay_pct: 0.10         # CONFIRM — of capital, per trade
+  theta_guard_minutes: 45              # CONFIRM — flag only, no action
+  theta_guard_min_r: 0.5               # 6.10 — flag if underlying has not moved 0.5R in favour
+  chain_snapshot_strikes: 10           # CONFIRM — ATM +/- n
+  chain_max_age_sec: 180               # CONFIRM
+  oi_tag_as_gate: false                # CONFIRM
+  oi_level_zone_strike_frac: 0.25      # 4.7.1 — zone width +/- 0.25 x strike_interval
+  oi_convergence_atr: 0.25             # 4.7.1 — merge with price level within 0.25 ATR
+  oi_convergence_bonus: 2              # 4.7.1 — strength +2 on convergence
+  pcr_extreme: {high: 1.5, low: 0.6}   # 4.7.3 — CONFIRM
+  iv_elevated_percentile: 80           # 4.7.4 — CONFIRM
+  expiry_day:
+    enabled: true                      # CONFIRM
+    last_entry: "13:30"                # CONFIRM
+    delta_band: [0.50, 0.75]           # CONFIRM
+    otm_allowed: false                 # CONFIRM
+    trail_activate_r: 0.7              # CONFIRM
+
+risk:
+  risk_per_trade: {nifty: 0.03, sensex: 0.03, gold: 0.02}
+  daily_loss_cap:  {indian: 0.10, gold: 0.05}
+  consecutive_loss_trigger: 3
+  max_concurrent:  {indian: 3, gold: 1}
+  vol_factor_floor: 0.5           # CONFIRM
+  nifty_sensex_correlated: true   # CONFIRM
+  atr_median_days: 20             # 7 — ATR_median_20d in the vol_factor formula
+
+learning:
+  enabled: true                   # 9 — confluence tightening only, never risk caps
+  sample_size: 30                 # CONFIRM — rolling 30-trade expectancy window
+  tighten_to_confluence: 5        # underperforming setup+market requires 5 of 6
+
+data:
+  sensex_delay_min: 15
+  sensex_min_trigger_tf: 5M       # CONFIRM
+  stale_feed_multiplier: 2
+  gold_spread_max: null           # CONFIRM — absolute value or ATR multiple
+  gap_recompute_atr: 1.0          # CONFIRM
+
+capital: null                     # CONFIRM — account capital in account currency; unset = FAIL
+
+paths:
+  signals: logs/signals.jsonl
+  trades: logs/trades.jsonl
+  rejections: logs/rejections.jsonl
+  overrides: logs/overrides.jsonl
+
+mode: paper                       # paper | live

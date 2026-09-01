@@ -1,11 +1,16 @@
-hmmlearn
-alpaca-py
+# Beast (beast/) - the brain defined by beast/soul/BEAST_SOUL_v3.md
 pandas
 numpy
+pyyaml
+pytest
+
+# Legacy regime-trader scaffold (core/, broker/, data/, backtest/, monitoring/).
+# Not imported by Beast; drop these when the scaffold goes.
+hmmlearn
+alpaca-py
 scipy
 ta
 scikit-learn
-pyyaml
 python-dotenv
 websocket-client
 schedule
