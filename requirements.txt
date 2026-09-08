@@ -1,12 +1,38 @@
-hmmlearn
-alpaca-py
-pandas
-numpy
-scipy
-ta
-scikit-learn
-pyyaml
-python-dotenv
-websocket-client
-schedule
-rich
+# --- core numerics -----------------------------------------------------------
+pandas>=2.0
+numpy>=1.24
+scipy>=1.10
+scikit-learn>=1.3
+
+# --- regime detection --------------------------------------------------------
+hmmlearn>=0.3.0
+
+# --- technical analysis ------------------------------------------------------
+# Beast implements its own Wilder-smoothed ADX/RSI/ATR in core/indicators.py so
+# that behaviour is identical in backtest and live. `ta` is available for the
+# exploratory extras in data/feature_engineering.py.
+ta>=0.11.0
+
+# --- brokers / market data ---------------------------------------------------
+# No Alpaca. It trades US equities and crypto, and can reach neither XAUUSD nor
+# Indian index options - the only instruments in scope. broker/paper_broker.py
+# is the simulated venue; broker/zerodha_client.py is the only live adapter.
+kiteconnect>=5.0.0          # Zerodha - Nifty/Sensex spot + option chain
+websocket-client>=1.6.0
+
+# --- config / runtime --------------------------------------------------------
+pyyaml>=6.0
+python-dotenv>=1.0.0
+schedule>=1.2.0
+pytz>=2023.3
+
+# --- monitoring --------------------------------------------------------------
+rich>=13.0.0                # terminal dashboard
+streamlit>=1.30.0           # browser dashboard: streamlit run monitoring/streamlit_app.py
+requests>=2.31.0
+
+# --- AI narration layer ------------------------------------------------------
+anthropic>=1.0.0
+
+# --- tests -------------------------------------------------------------------
+pytest>=7.4.0

@@ -1,0 +1,420 @@
+# ==============================================================================
+# BEAST - master configuration  (Appendix A of the soul file, plus `regime:`)
+# ==============================================================================
+# Source of truth: beast-soul-file-v3.1.md, Appendix A.
+#
+# CONFIG DISCIPLINE (soul file, "Config discipline"):
+#   This is the ONLY place a threshold may be a literal. Every module reads
+#   from here via core.config.get_config(). Changing a flagged default must be
+#   a one-line change in this file and nowhere else.
+#
+#   Values marked "# CONFIRM" are defaults awaiting operator confirmation.
+#   Values marked "# v3.1"   were changed by the v3.1 revision.
+#   Values that are `null` and marked BLOCKER are treated as FAILING, not
+#   passing - Beast refuses to size or trade the affected instrument until a
+#   real number is supplied. This is deliberate (soul file 5.7.3, 7.1).
+#
+# CONFLICT 1 IS RESOLVED AS PATH B (operator decision, 2026-09-08):
+#   Analysis stays on the underlying for every market. Immutable Rule 9 stands
+#   unedited; instruction-block item 0 is reverted. Section 4.7 widens instead,
+#   so OI / IV / delta / liquidity carry more weight as chain-derived inputs to
+#   the underlying-based engine. `instruments.*.analyse` therefore stays
+#   `index_spot` / `xauusd` below, and no premium series reaches the indicator
+#   engine. See DECISIONS.md and docs/soul-v3.2-proposed-diff.md.
+# ==============================================================================
+
+mode: paper                       # paper | live   (soul file 10)
+
+# v3.1 item 6 / Section 10: paper mode now runs COMPLETE simulated execution -
+# entry, stop, target, trail and exit are all placed and managed, and every
+# qualifying signal is carried through to a recorded exit against a 6.6 code.
+# The only difference from live is that the broker call is stubbed. Setting this
+# false reverts to the stale v3.0 alert-only behaviour and is not recommended.
+paper_full_execution: true        # v3.1 - CONFIRM
+
+# ------------------------------------------------------------------------------
+# broker
+# ------------------------------------------------------------------------------
+broker:
+  paper_trading: true             # master kill-switch; true => no real orders ever
+  symbols:
+    - XAUUSD                      # Gold, analysed on spot, traded as futures
+    - NIFTY50                     # Nifty 50 index, analysed on spot, traded as long options
+    # - SENSEX                    # enable once lot size / strike interval confirmed (BLOCKER 18)
+  routing:                        # which broker adapter serves which market
+    NIFTY50: zerodha
+    SENSEX: zerodha
+    XAUUSD: paper                 # simulated. Beast has no live XAUUSD venue yet;
+                                  #   the previous Alpaca route could not trade
+                                  #   XAUUSD or Indian index options at all.
+  order_type: market              # market | limit - hard-flat always uses market
+  paper:
+    fill_model: conservative      # soul file 6.8 - never assume the favourable fill
+    slippage_pct: 0.0005          # CONFIRM - applied against the trigger-candle close
+  zerodha:
+    paper: true
+    exchange_index: NFO           # options segment
+    exchange_spot: NSE
+
+# ------------------------------------------------------------------------------
+# hmm - DEPRECATED legacy overlay, inert
+# ------------------------------------------------------------------------------
+# SUPERSEDED BY THE `regime:` BLOCK BELOW. This block configures
+# core/hmm_engine.py::HMMRegimeEngine, the first-generation volatility overlay.
+# It is retained only so that the existing entry pipeline imports keep working,
+# and it is DISABLED: with `enabled: false` the engine returns an inert state
+# and nothing it computes reaches a signal, a log line or a sizing decision.
+#
+# It is disabled rather than deleted because Phase 1 of the regime build is
+# explicitly forbidden from touching the entry pipeline. Two defects make it
+# unfit to run alongside the new layer, and both are why it is off:
+#   1. It infers with hmmlearn's `predict_proba`, which is forward-BACKWARD
+#      smoothing - it revises past states using future bars. That is look-ahead
+#      bias. core/regime/hmm_engine.py uses the forward algorithm only.
+#   2. It labels states with a directional component ("low_vol_up"), on a model
+#      that has no directional mandate.
+# DELETE THIS BLOCK AND THE ENGINE IN PHASE 2, when the G10 wire-in lands.
+hmm:
+  enabled: false                  # deprecated - see above. Do not re-enable.
+  as_gate: false                  # never true; the replacement gate is G10_VOL_STATE
+  n_candidates: [3, 4, 5, 6, 7]
+  n_init: 10
+  covariance_type: full
+  min_train_bars: 252
+  stability_bars: 3
+  flicker_window: 20
+  flicker_threshold: 4
+  min_confidence: 0.55
+  refit_every_bars: 126
+  random_state: 42
+
+# ------------------------------------------------------------------------------
+# regime - volatility-state layer (core/regime/)  [NEW]
+# ------------------------------------------------------------------------------
+# The HMM is a VOLATILITY CLASSIFIER. It answers one question: is this market
+# calm, normal or turbulent? It does not predict direction, generate signals or
+# pick setups.
+#
+# NAMING, enforced in code (core/regime/contracts.py):
+#   `regime`    - reserved for soul file 4.4: TREND_UP | TREND_DOWN | RANGE.
+#   `vol_state` - the HMM's output: CALM | NORMAL | TURBULENT | UNKNOWN.
+# Two concepts, two names, everywhere.
+#
+# The bias timeframe is read from the `timeframes:` block above and is NOT
+# redefined here. Nothing in this block may duplicate an Appendix A value.
+regime:
+  enabled: true
+
+  hmm:
+    n_candidates: [3, 4, 5, 6, 7]
+    n_init: 10                     # random restarts per candidate
+    covariance_type: full
+    # Bias-TF bars, not daily bars. Indian 15M 09:15-15:30 = 25 bars/session
+    # ~= 6,250/yr; Gold 30M 05:00-21:00 = 32 bars/session ~= 8,000/yr. Two years.
+    min_train_bars: {nifty: 12500, sensex: 12500, gold: 16000}   # CONFIRM
+    retrain_interval_days: 7
+    retrain_window: expanding      # CONFIRM - expanding | rolling
+    rolling_window_bars: 25000     # only read when retrain_window is `rolling`
+    max_model_age_days: 10         # refuse to trade on a staler model
+    random_state: 42               # determinism: same data => same states
+
+  features:
+    # Bias-TF bars. 252 is ~10 Indian / ~8 Gold sessions - short for a
+    # volatility baseline. Raising it costs warm-up bars and nothing else.
+    zscore_lookback: 252           # CONFIRM
+    use_volume: {nifty: true, sensex: true, gold: false}   # CONFIRM
+                                   # XAUUSD spot is OTC: feeds report tick counts,
+                                   # which measure the provider's update rate, not
+                                   # traded size. Not a volume series.
+
+  stability:
+    confirm_bars: 3                # bars a new state must persist before confirmation
+    flicker_window: 20
+    flicker_threshold: 4           # changes per window that force uncertainty mode
+    min_confidence: 0.55           # below this, treat as unconfirmed
+    stale_max_bars: 6              # CONFIRM - hold last state this long on failure
+    carry_across_sessions: true    # CONFIRM - carry the last confirmed state and the
+                                   #   consecutive_bars count over the session boundary,
+                                   #   so the first hour is not spent in uncertainty mode
+
+  sizing:
+    # Combined with section 7's vol_factor by min(), NOT by product. Multiplying
+    # them double-counts volatility and the product's floor (0.5 x 0.5) would
+    # silently override risk.vol_factor_floor, which is a soul-file value.
+    # The floor is risk.vol_factor_floor and there is no second floor here.
+    combine_method: min            # MUST be min; `product` is rejected at load
+    size_multiplier: {CALM: 1.00, NORMAL: 1.00, TURBULENT: 0.60, UNKNOWN: 0.50}  # CONFIRM
+    uncertainty_size_mult: 0.50    # applied when unconfirmed or flickering
+
+  veto:
+    # veto only ever BLOCKS. It can never permit a trade the G0-G9 chain rejected.
+    on_turbulent: false            # CONFIRM - TURBULENT shrinks size; does not block
+    on_turbulent_counter_bias: false  # CONFIRM - 4.4 already requires 5-of-6 counter-bias
+    on_unknown: false              # CONFIRM
+
+  backtest:
+    train_sessions: 60             # CONFIRM - walk-forward, in SESSIONS not daily bars
+    test_sessions: 20
+    step_sessions: 20
+    slippage_pct: 0.0005
+
+  paths:
+    model_dir: ./models            # one persisted model per market
+
+# ------------------------------------------------------------------------------
+# indicators  (soul file 4.1)
+# ------------------------------------------------------------------------------
+indicators:
+  adx_period: 14                  # CONFIRM
+  adx_trend_threshold: 20         # CONFIRM
+  stoch: {k: 14, smooth: 3, d: 3}                        # CONFIRM
+  stoch_levels: {oversold: 20, overbought: 80}           # CONFIRM
+  macd: {fast: 12, slow: 26, signal: 9}                  # CONFIRM
+  rsi_period: 14                  # CONFIRM
+  rsi_levels: {oversold: 30, mid: 50, overbought: 70}    # CONFIRM
+  bb: {period: 20, stddev: 2.0}   # CONFIRM
+  atr_period: 14                  # CONFIRM - utility only, NEVER counted in the 4-of-6
+
+# ------------------------------------------------------------------------------
+# timeframes  (soul file 4.3 - three-tier cascade)
+# ------------------------------------------------------------------------------
+timeframes:
+  indian: {bias: 15M, setup: 5M, trigger: 1M}
+  gold: {bias: 30M, setup: 15M, trigger: 1M}       # 30M gold-only - CONFIRM (open item 2)
+
+# ------------------------------------------------------------------------------
+# sessions  (soul file 3, all times IST)
+# ------------------------------------------------------------------------------
+sessions:
+  timezone: Asia/Kolkata
+  # v3.1 - last_entry 14:30 and flatten_begin 15:00 were set by the operator.
+  # hard_flat 15:05 is CONFIRM: it preserves the 5-minute flatten-to-hard-flat
+  # gap carried over from v3.0 (soul file, open question A).
+  indian: {open: "09:15", close: "15:30", last_entry: "14:30", flatten_begin: "15:00", hard_flat: "15:05", opening_guard_min: 15}   # v3.1
+  gold: {open: "05:00", close: "21:00", last_entry: "20:30", flatten_begin: "20:50", hard_flat: "20:55", opening_guard_min: 0}      # CONFIRM
+
+# ------------------------------------------------------------------------------
+# levels  (soul file 4.5 - level engine)
+# ------------------------------------------------------------------------------
+levels:
+  fractal_n: 2                    # CONFIRM - swing = extreme of N candles either side
+  swing_lookback: 100             # candles scanned on the relevant TF
+  sr_cluster_atr: 0.15            # CONFIRM - swings within this x ATR cluster into a zone
+  sr_zone_width_atr: 0.25         # CONFIRM
+  sr_invalidate_atr: 0.5          # close beyond zone by this x ATR kills it (flip candidate)
+  trendline_min_touches: 3
+  trendline_max_dev_atr: 0.20     # CONFIRM
+  trendline_break_atr: 0.10       # CONFIRM
+  ob_impulse_candles: 3           # consecutive same-direction closes that count as impulse
+  ob_impulse_atr: 1.5             # or a move of this x ATR within ob_impulse_window
+  ob_impulse_window: 5
+  ob_zone_mode: body              # body | wick - CONFIRM (open item 10)
+  ob_fresh_retests: 1             # CONFIRM - fresh until traded into this many times
+  ob_expiry: session              # session | 24h - CONFIRM
+  rejection_wick_ratio: 0.50      # wick must be >= this fraction of candle range
+
+# ------------------------------------------------------------------------------
+# entry  (soul file 5)
+# ------------------------------------------------------------------------------
+entry:
+  min_confluence: 4
+  min_confluence_counter_bias: 5  # CONFIRM (open item 12)
+  opposing_reject_count: 3        # CONFIRM - opposing count >= this rejects regardless
+  setup1_trigger_mode: break_close   # break_close | retest - CONFIRM (open item 9)
+  setup1_momentum_atr: 1.2        # CONFIRM
+  setup2_blowthrough_atr: 2.5     # CONFIRM - arrival impulse wider than this => wait for 2nd test
+  setup4_max_retrace: 0.618       # CONFIRM
+  signal_validity_candles: 5      # CONFIRM - setup-TF candles for the trigger to fire
+  level_reentry_cap: 2            # CONFIRM - failed attempts before a level is blacklisted
+  post_loss_cooldown_min: 15      # CONFIRM
+  news_blackout_min: {before: 15, after: 15}       # CONFIRM (open item 3)
+  range_regime_allowed_setups: [2, 3]              # CONFIRM (open item 11)
+  duplicate_suppression_atr: 0.25 # identical signal within this x ATR is suppressed
+  definitions:                    # 5.4 machine-checkable definitions
+    rising_lookback: 3            # value vs value N candles ago
+    rising_min_delta: 0.5         # difference must exceed this to count as a change
+    fresh_crossover_bars: 3       # a cross is "fresh" within this many closed candles
+    near_level_atr: 0.5           # crossing candle body within this x ATR of zone centre
+    histogram_expand_bars: 2      # |hist| must increase on each of the last N candles
+    band_walk_lookback: 3         # "walking the band" window
+    band_walk_min_closes: 2       # at least N of the last band_walk_lookback closes
+    band_walk_tolerance_atr: 0.1
+    vwap_hold_lookback: 5         # candles in which the VWAP hold must have occurred
+    vwap_hold_atr: 0.25
+    divergence_lookback: 20       # candles for the RSI-divergence swing comparison
+
+# ------------------------------------------------------------------------------
+# exit  (soul file 6)
+# ------------------------------------------------------------------------------
+exit:
+  target_r: 2.0                   # CONFIRM (open item 5)
+  target_infeasible_policy: reject    # reject | target_level_min_1.5R - CONFIRM (open item 7)
+  target_level_min_r: 1.5         # only used when policy is target_level_min_1.5R
+  stop_buffer_atr: 0.25           # CONFIRM
+  stop_min_atr: 0.5               # CONFIRM
+  stop_max_atr: 2.5               # CONFIRM - exceeded => reject at G7, never size down
+  trail_activate_r: 1.0           # CONFIRM (open item 6)
+  trail_method: atr_chandelier    # atr_chandelier | structure_trail - CONFIRM
+  trail_atr_mult: 1.5             # CONFIRM
+  breakeven_cost_buffer_r: 0.05   # BE+costs step on trail activation, in R
+  partial_exit_enabled: false     # CONFIRM (open item 16)
+  partial_exit_r: 1.0
+  partial_exit_fraction: 0.5
+  time_stop_enabled: false        # CONFIRM (open item 16)
+  time_stop_bars: 20
+  time_stop_min_r: 0.5
+  stop_fills_first_in_bar: true   # 6.8 - never assume the favourable fill
+
+# ------------------------------------------------------------------------------
+# instruments  (soul file 3.1)
+# ------------------------------------------------------------------------------
+instruments:
+  nifty:
+    analyse: index_spot
+    trade: options
+    option_side: long_only        # CONFIRM (open item 20) - no selling, no spreads
+    lot_size: null                # BLOCKER 18 - null => refuse to size
+    strike_interval: null         # BLOCKER 18 - e.g. 50
+    prefer_broker_contract_master: true   # read lot size / ladder from broker API when available
+  sensex:
+    analyse: index_spot
+    trade: options                # CONFIRM (open item 1) - assumed same as Nifty
+    option_side: long_only
+    lot_size: null                # BLOCKER 18
+    strike_interval: null         # BLOCKER 18
+    prefer_broker_contract_master: true
+  gold:
+    analyse: xauusd
+    trade: futures
+    venue: null                   # BLOCKER 17 - COMEX_GC | MCX_GOLD | MCX_GOLDM | CFD
+    contract_multiplier: null     # BLOCKER 17
+    tick_size: null               # BLOCKER 17
+    tick_value: null              # BLOCKER 17
+    lot_size: 1
+    rollover_buffer_days: 3       # CONFIRM - no entries inside the rollover window
+
+# ------------------------------------------------------------------------------
+# options  (soul file 4.7, 5.7, 6.10, 7.1)
+# ------------------------------------------------------------------------------
+options:
+  expiry_preference: nearest_weekly    # CONFIRM (open item 25)
+  target_delta: 0.55                   # CONFIRM (open item 21)
+  delta_band: [0.45, 0.65]             # CONFIRM
+  min_oi: null                         # BLOCKER 19 - unset is treated as FAIL, not pass
+  min_volume: null                     # BLOCKER 19
+  min_premium: null                    # BLOCKER 19
+  max_spread_abs: 1.00                 # CONFIRM - ceiling is max(abs, pct x mid)
+  max_spread_pct: 0.01                 # CONFIRM
+  premium_stop_pct: 0.35               # CONFIRM (open item 22) - exit at 65% of entry premium
+  max_premium_outlay_pct: 0.10         # CONFIRM (open item 23) - of capital, per trade
+  theta_guard_minutes: 45              # CONFIRM - flag only, no forced action
+  theta_guard_min_r: 0.5
+  chain_snapshot_strikes: 10           # CONFIRM - ATM +/- n
+  chain_max_age_sec: 180               # CONFIRM
+  oi_tag_as_gate: false                # CONFIRM (open item 28) - context only
+  pcr_extreme: {low: 0.6, high: 1.5}   # CONFIRM
+  iv_elevated_percentile: 80           # CONFIRM
+  iv_percentile_lookback_sessions: 30
+  oi_zone_strike_fraction: 0.25        # OI zone half-width = this x strike_interval
+  level_convergence_atr: 0.25          # OI level within this x ATR of a price level => bonus
+  level_convergence_bonus: 2
+  expiry_day:                          # 5.7.4 - CONFIRM (open item 24)
+    enabled: true
+    last_entry: "13:30"
+    delta_band: [0.50, 0.75]
+    otm_allowed: false
+    trail_activate_r: 0.7
+
+# ------------------------------------------------------------------------------
+# risk  (soul file 7)
+# ------------------------------------------------------------------------------
+risk:
+  # `capital` is ABSENT from the soul file's Appendix A, yet every formula in
+  # section 7 and 7.1 is `capital x pct`. Nothing can be sized without it, so it
+  # lives here and is proposed for Appendix A in the v3.2 diff. Refreshed from
+  # the broker in live mode.
+  capital: 500000
+  risk_per_trade: {nifty: 0.05, sensex: 0.03, gold: 0.02}    # v3.1 - nifty 0.03 -> 0.05
+  # v3.1 - nifty 0.10 -> 0.15, and the cap is now per-INSTRUMENT rather than one
+  # combined Indian-session number (soul file, open question B). Worst case is
+  # 25% combined across Nifty and Sensex. See DECISIONS.md D-07: the session
+  # PAUSE switch is still family-scoped, so in practice the tighter of the two
+  # trips first. That is stricter than v3.1 intends, never looser.
+  daily_loss_cap: {nifty: 0.15, sensex: 0.10, gold: 0.05}    # v3.1
+  consecutive_loss_trigger: 3
+  max_concurrent: {indian: 3, gold: 1}
+  vol_factor_floor: 0.5           # CONFIRM - vol_factor clamps to [floor, 1.0]; shrinks only
+  vol_atr_median_days: 20
+  nifty_sensex_correlated: true   # CONFIRM (open item 13)
+
+# ------------------------------------------------------------------------------
+# data  (soul file 4.6)
+# ------------------------------------------------------------------------------
+data:
+  sensex_delay_min: 15
+  sensex_min_trigger_tf: 5M       # CONFIRM - Sensex excluded from anything tighter
+  stale_feed_multiplier: 2        # last close older than N x trigger-TF interval => STALE
+  gold_spread_max: null           # BLOCKER 15 - null => high-spread rule cannot be enforced
+  gold_spread_max_mode: absolute  # absolute | atr_multiple
+  gap_recompute_atr: 1.0          # CONFIRM
+  history_bars: 1500              # bars held in memory per timeframe
+  cache_dir: ./.cache
+
+# ------------------------------------------------------------------------------
+# news / economic calendar  (soul file 5.6)
+# ------------------------------------------------------------------------------
+news:
+  calendar_file: config/economic_calendar.yaml
+  fail_closed: true               # feed unavailable => blackout treated as ACTIVE (5.6)
+  standing_windows:
+    - {name: "US CPI", market: GOLD, time_ist: "18:00", weekday: null}
+    - {name: "US NFP", market: GOLD, time_ist: "18:00", weekday: 4}
+    - {name: "FOMC", market: GOLD, time_ist: "23:30", weekday: null}
+    - {name: "RBI Policy", market: INDIAN, time_ist: "10:00", weekday: null}
+
+# ------------------------------------------------------------------------------
+# backtest
+# ------------------------------------------------------------------------------
+backtest:
+  slippage_pct: 0.0005
+  initial_capital: 100000
+  train_window: 252               # bars in each walk-forward training slice
+  test_window: 126                # bars in each out-of-sample slice
+  step_size: 126                  # walk-forward step
+  risk_free_rate: 0.045           # annualised, for Sharpe
+  commission_per_lot: 20.0        # brokerage + charges estimate, per lot per side
+  bars_per_year: 252
+
+# ------------------------------------------------------------------------------
+# monitoring
+# ------------------------------------------------------------------------------
+monitoring:
+  dashboard_refresh_seconds: 5
+  alert_rate_limit_minutes: 15
+  log_dir: ./logs
+  log_level: INFO
+  journal_db: ./logs/beast_journal.sqlite
+  alerts:
+    email_enabled: false
+    email_to: null
+    email_from: null
+    smtp_host: null
+    smtp_port: 587
+    webhook_enabled: false
+    webhook_url: null
+
+# ------------------------------------------------------------------------------
+# ai - Claude narration / review layer
+# ------------------------------------------------------------------------------
+# The AI layer NEVER creates, approves or vetoes a trade. Every trade decision is
+# made by the deterministic pipeline in core/signal_generator.py. Claude writes
+# the human-readable reason line (11), the weekly review (9), and the override
+# friction prompt (8). This separation is the whole point of the soul file.
+ai:
+  enabled: true
+  model: claude-opus-5
+  max_tokens: 4000
+  effort: low                     # low | medium | high | xhigh | max
+  narrate_signals: true
+  weekly_review: true
+  advisory_only: true             # MUST stay true - see 13 immutable rules

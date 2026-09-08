@@ -1,0 +1,14 @@
+# Streamlit settings for the Beast dashboard.
+#
+# headless = true skips the first-run email prompt, which otherwise blocks on
+# stdin and kills the process when it is started from a script or a service.
+# The URL is printed either way; open it yourself.
+[server]
+headless = true
+port = 8501
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark"
