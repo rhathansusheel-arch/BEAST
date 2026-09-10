@@ -39,7 +39,10 @@ broker:
   paper_trading: true             # master kill-switch; true => no real orders ever
   symbols:
     - XAUUSD                      # Gold, analysed on spot, traded as futures
-    - NIFTY50                     # Nifty 50 index, analysed on spot, traded as long options
+    # - NIFTY50                   # DISCONNECTED while the MT5 gold leg is built. The
+                                  #   Zerodha adapter and the whole option-chain engine
+                                  #   are retained untouched - only the market is off,
+                                  #   so re-enabling is this one line.
     # - SENSEX                    # enable once lot size / strike interval confirmed (BLOCKER 18)
   routing:                        # which broker adapter serves which market
     NIFTY50: zerodha
@@ -55,6 +58,46 @@ broker:
     paper: true
     exchange_index: NFO           # options segment
     exchange_spot: NSE
+  mt5:                            # MetaTrader 5 - XAUUSD spot data + execution
+    # Credentials are NOT here. They come from the environment only:
+    # MT5_GOLD_LOGIN / MT5_GOLD_PASSWORD / MT5_GOLD_SERVER (.env is gitignored).
+    # Route XAUUSD here by setting `routing: XAUUSD: mt5` above, once
+    # scripts/mt5_check.py passes.
+    active_profile: gold
+    account_mode: demo            # demo | live. live ALSO requires BEAST_ALLOW_LIVE=1,
+                                  #   because one switch is one typo from a funded account.
+    profiles:
+      gold:
+        host: 127.0.0.1           # RPyC must never bind beyond loopback: anyone who
+                                  #   reaches this port controls the trading account.
+        port: 18812
+        env_prefix: MT5_GOLD      # -> MT5_GOLD_LOGIN / _PASSWORD / _SERVER
+        symbols:
+          XAUUSD: ""              # "" => discover (XAUUSD / XAUUSD.m / XAUUSDm / GOLD)
+    bridge:
+      enabled: false              # true on Linux => mt5linux (Wine + RPyC) instead
+                                  #   of the Windows-only MetaTrader5 package
+    timeouts:                     # nothing may block Beast's loop indefinitely
+      fast_seconds: 5             #   ticks, terminal_info, account_info
+      history_seconds: 30         #   bar fetches
+      connect_seconds: 30         #   initialize and the handshake
+    ready_wait_seconds: 180       # on reboot the terminal may come up after Beast
+    health:
+      interval_seconds: 5
+      latency_warn_ms: 750
+      latency_samples: 50
+      failures_before_halt: 3     # then HALTED: no new entries, exits keep running
+    retry:
+      max_attempts: 3             # only ever on requote / price-changed
+    refresh_bars: 5               # bars pulled per cycle after the first full fetch
+    deviation_points: 20          # max slippage tolerated on a market order
+    comment_limit: 31             # broker comment length; half the reconcile key
+    magic: 20260910               # tags Beast's orders; the other half of that key
+    server_utc_offset_hours: 0    # fallback only - measured at every handshake
+    offset_probe_symbol: XAUUSD
+    units:                        # systemd units, for the watchdog and failure drill
+      terminal: ""                #   e.g. mt5-terminal.service
+      server: ""                  #   e.g. mt5linux.service
 
 # ------------------------------------------------------------------------------
 # hmm - DEPRECATED legacy overlay, inert
@@ -402,6 +445,9 @@ monitoring:
     smtp_port: 587
     webhook_enabled: false
     webhook_url: null
+    telegram_enabled: false       # token and chat id come from the environment:
+                                  #   BEAST_TELEGRAM_TOKEN / BEAST_TELEGRAM_CHAT_ID
+    telegram_chat_id: null        # optional non-secret fallback for the chat id
 
 # ------------------------------------------------------------------------------
 # ai - Claude narration / review layer

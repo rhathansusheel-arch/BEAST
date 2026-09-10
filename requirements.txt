@@ -20,6 +20,14 @@ ta>=0.11.0
 kiteconnect>=5.0.0          # Zerodha - Nifty/Sensex spot + option chain
 websocket-client>=1.6.0
 
+# MetaTrader 5 - XAUUSD spot data + demo execution (broker/mt5_paper_adapter.py).
+# WINDOWS ONLY: every published wheel is win_amd64 and there is no sdist, so an
+# unconditional entry would make `pip install -r requirements.txt` fail outright
+# on Linux. The marker keeps a Linux host installable.
+MetaTrader5>=5.0.45; sys_platform == "win32"
+# On Linux, install the Wine + rpyc bridge instead and set broker.mt5.bridge:
+#   pip install mt5linux      (it also needs MT5 installed under Wine)
+
 # --- config / runtime --------------------------------------------------------
 pyyaml>=6.0
 python-dotenv>=1.0.0

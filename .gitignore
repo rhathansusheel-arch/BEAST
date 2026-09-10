@@ -28,3 +28,6 @@ venv/
 Thumbs.db
 .idea/
 .vscode/
+
+# claude code local session state
+.claude/

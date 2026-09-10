@@ -479,38 +479,43 @@ def main() -> None:
             "attach to the process - there is no control socket to attach to."
         )
 
-    snapshot = load_snapshot(cfg)
-    directory = log_directory(cfg)
-    journal_path = Path(str(cfg.get("monitoring.journal_db")))
-    if not journal_path.is_absolute():
-        journal_path = PROJECT_ROOT / journal_path
+    @st.fragment(run_every=REFRESH_SECONDS if auto else None)
+    def live_view() -> None:
+        """The values that change while Beast runs.
 
-    header(cfg, snapshot)
-    st.divider()
+        Wrapped in a fragment so auto-refresh reruns and redraws only this
+        block - a Streamlit-level diff of the metrics, tables and panels below
+        - rather than reloading the whole browser page every cycle, which
+        used to reset scroll position and re-fetch the sidebar for no reason.
+        """
+        snapshot = load_snapshot(cfg)
+        directory = log_directory(cfg)
+        journal_path = Path(str(cfg.get("monitoring.journal_db")))
+        if not journal_path.is_absolute():
+            journal_path = PROJECT_ROOT / journal_path
 
-    left, right = st.columns([3, 2])
-    with left:
-        volatility_panel(snapshot, read_log_stream(directory / "regime.log"))
+        header(cfg, snapshot)
         st.divider()
-        positions_panel(snapshot)
-        st.divider()
-        risk_panel(cfg, snapshot)
-    with right:
-        alerts_panel(directory / "alerts.log")
-        st.divider()
-        gates_panel(journal_path)
 
-    st.divider()
-    signals_panel(journal_path)
-    trades_panel(journal_path)
-    st.divider()
-    system_panel(cfg, snapshot, read_log_stream(directory / "main.log", limit=60))
+        left, right = st.columns([3, 2])
+        with left:
+            volatility_panel(snapshot, read_log_stream(directory / "regime.log"))
+            st.divider()
+            positions_panel(snapshot)
+            st.divider()
+            risk_panel(cfg, snapshot)
+        with right:
+            alerts_panel(directory / "alerts.log")
+            st.divider()
+            gates_panel(journal_path)
 
-    if auto:
-        st.markdown(
-            f"<meta http-equiv='refresh' content='{REFRESH_SECONDS}'>",
-            unsafe_allow_html=True,
-        )
+        st.divider()
+        signals_panel(journal_path)
+        trades_panel(journal_path)
+        st.divider()
+        system_panel(cfg, snapshot, read_log_stream(directory / "main.log", limit=60))
+
+    live_view()
 
 
 main()

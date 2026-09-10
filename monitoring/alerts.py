@@ -164,6 +164,7 @@ class AlertManager:
         )
         self._email(alert)
         self._webhook(alert)
+        self._telegram(alert)
         return True
 
     # -- convenience wrappers -------------------------------------------------
@@ -426,6 +427,45 @@ class AlertManager:
             )
         except Exception as error:
             logger.error("Webhook alert failed: %s", error)
+
+    def _telegram(self, alert: Alert) -> None:
+        """Send to Telegram when configured. Failures are logged, never raised.
+
+        The bridge layer's halts and reconnects are the alerts an operator has to
+        see on a phone, which is why this exists alongside the generic webhook
+        rather than being left to it: a relay is one more thing that can be down
+        when the thing it was meant to report is already down.
+        """
+        settings = self.cfg.get("monitoring.alerts")
+        if not settings.get("telegram_enabled"):
+            return
+
+        token = self.cfg.credential("alerts.telegram_token", "BEAST_TELEGRAM_TOKEN")
+        chat_id = self.cfg.credential(
+            "alerts.telegram_chat_id", "BEAST_TELEGRAM_CHAT_ID"
+        ) or settings.get("telegram_chat_id")
+        if not token or not chat_id:
+            logger.error(
+                "Telegram alerts enabled but BEAST_TELEGRAM_TOKEN or "
+                "BEAST_TELEGRAM_CHAT_ID is unset"
+            )
+            return
+
+        try:
+            import requests
+
+            requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={
+                    "chat_id": str(chat_id),
+                    "text": f"[{alert.kind.value}] {alert.market}\n{alert.message}",
+                    "disable_web_page_preview": True,
+                },
+                timeout=5,
+            )
+        except Exception as error:
+            # Never let the token reach a log line.
+            logger.error("Telegram alert failed: %s", type(error).__name__)
 
     # -- queries -------------------------------------------------------------
 

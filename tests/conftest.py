@@ -46,6 +46,13 @@ def _fill_blockers(cfg: Config) -> Config:
     cfg.section("data")["gold_spread_max"] = 0.60
     cfg.section("hmm")["enabled"] = False       # keep unit tests fast and offline
     cfg.section("ai")["enabled"] = False        # never call the API from tests
+
+    # The shipped config has NIFTY50 commented out of broker.symbols while the
+    # MT5 gold leg is built. The Zerodha adapter and the whole option path are
+    # retained and must stay tested, so the suite re-enables the market for the
+    # same reason it fills the blockers above: these tests exercise the engine,
+    # not the operator's current routing.
+    cfg.section("broker")["symbols"] = ["XAUUSD", "NIFTY50"]
     return cfg
 
 
