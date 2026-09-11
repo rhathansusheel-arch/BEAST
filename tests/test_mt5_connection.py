@@ -341,7 +341,7 @@ def test_portable_flag_reaches_initialize(cfg, monkeypatch):
 
 
 def test_initialize_failure_reports_the_terminals_own_error(cfg, monkeypatch):
-    """-6 from the terminal must reach the log verbatim, not a generic hint."""
+    """-6 from the terminal must reach the log verbatim, and must not be retried."""
     monkeypatch.setenv("MT5_GOLD_LOGIN", "778899")
     monkeypatch.setenv("MT5_GOLD_PASSWORD", "pw")
     monkeypatch.setenv("MT5_GOLD_SERVER", "Fake-Demo")
@@ -351,10 +351,25 @@ def test_initialize_failure_reports_the_terminals_own_error(cfg, monkeypatch):
     link = _link(cfg, client)
     link._injected = False
     link._start_worker()
-    with pytest.raises(BridgeUnavailable) as error:
+    with pytest.raises(BridgeMisconfigured) as error:
         link._initialise()
     assert "Authorization failed" in str(error.value)
     assert "rejected the login" in str(error.value)
+
+
+def test_a_missing_terminal_is_retried_not_fatal(cfg, monkeypatch):
+    """-10003 means the terminal is not up yet - that one is worth waiting for."""
+    monkeypatch.setenv("MT5_GOLD_LOGIN", "778899")
+    monkeypatch.setenv("MT5_GOLD_PASSWORD", "pw")
+    monkeypatch.setenv("MT5_GOLD_SERVER", "Fake-Demo")
+    client = FakeMT5()
+    client.initialize = lambda **kw: False
+    client.last_error = lambda: (-10003, "IPC initialize failed")
+    link = _link(cfg, client)
+    link._injected = False
+    link._start_worker()
+    with pytest.raises(BridgeUnavailable):
+        link._initialise()
 
 
 def test_real_account_never_reaches_order_send(cfg):
