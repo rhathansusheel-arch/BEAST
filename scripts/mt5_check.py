@@ -77,16 +77,15 @@ def check_environment(link: MT5Connection) -> None:
     profile = link.profile
     host = cfg.get(f"broker.mt5.profiles.{profile}.host", "?")
     port = cfg.get(f"broker.mt5.profiles.{profile}.port", "?")
-    bridged = bool(cfg.get("broker.mt5.bridge.enabled", False))
+    bridged = link._is_bridge()
 
-    version = "native MetaTrader5 package"
+    version = "native MetaTrader5 package (Windows)"
     if bridged:
         try:
-            import mt5linux
-            version = f"mt5linux {getattr(mt5linux, '__version__', 'unknown')} " \
-                      f"({mt5linux.__file__})"
+            import rpyc
+            version = f"RPyC {rpyc.__version__} classic bridge to the Wine-side MetaTrader5"
         except ImportError:
-            version = "mt5linux NOT INSTALLED"
+            version = "rpyc NOT INSTALLED"
     report(INFO, f"profile {profile}: {version}", f"endpoint {host}:{port}")
 
     if bridged and str(host) not in ("127.0.0.1", "localhost", "::1"):

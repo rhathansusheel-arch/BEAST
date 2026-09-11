@@ -175,6 +175,7 @@ class MT5Connection:
 
         self._client = client
         self._injected = client is not None
+        self._conn: Any = None
         self._worker: ThreadPoolExecutor | None = None
         self._worker_poisoned = False
         self._state_lock = threading.Lock()
@@ -305,7 +306,7 @@ class MT5Connection:
 
     def _materialise(self, value: Any) -> Any:
         """Pull a netref across the wire once, instead of per attribute read."""
-        if value is None or not self._is_bridge():
+        if value is None or self._conn is None:
             return value
         try:
             import rpyc
@@ -384,6 +385,8 @@ class MT5Connection:
             except Exception as error:
                 logger.warning("MT5 shutdown raised: %s", error)
         self._stop_worker()
+        if not self._injected:
+            self._close_bridge()
         self._set_state(ConnectionState.DISCONNECTED, "disconnected")
 
     def _start_worker(self) -> None:
@@ -392,8 +395,16 @@ class MT5Connection:
             return
         if self._worker is not None:
             # Abandon it: the hung call still holds the thread. It is a daemon
-            # thread, so it cannot keep the interpreter alive.
+            # thread, so it cannot keep the interpreter alive. Over the bridge
+            # the hung call also holds the RPyC connection's request lock, so
+            # that is reopened too - the old socket is left to the thread.
             self._worker.shutdown(wait=False)
+            if self._is_bridge() and not self._injected and self._client is not None:
+                try:
+                    self._conn = None
+                    self._open_client()
+                except BridgeError as error:
+                    logger.error("could not reopen the bridge after a timeout: %s", error)
         self._worker = ThreadPoolExecutor(max_workers=1,
                                           thread_name_prefix=f"mt5-{self.profile}")
         self._worker_poisoned = False
@@ -405,22 +416,37 @@ class MT5Connection:
         self._worker_poisoned = False
 
     def _open_client(self) -> None:
-        """Import the bridge or the native package and build the client."""
+        """Bind ``self._client`` to the MetaTrader5 module, local or remote.
+
+        On Linux the module lives in the Wine-side Python behind an RPyC
+        classic server, and ``conn.modules.MetaTrader5`` is a live proxy of it.
+        That proxy is used directly rather than through the ``mt5linux`` client
+        class: the server it ships is that same bare classic server, and its
+        1.1.1 client insists on managing a Docker container, which is not the
+        topology here. Every attribute of the proxy resolves over the wire, so
+        constants like ``TIMEFRAME_M1`` work unchanged.
+        """
         if self._is_bridge():
             try:
-                from mt5linux import MetaTrader5
+                import rpyc
             except ImportError as error:
-                raise BridgeUnavailable(
-                    "mt5linux is not installed on the Linux side"
-                ) from error
+                raise BridgeUnavailable("rpyc is not installed on the Linux side") from error
             host = str(self._profile_setting("host", "127.0.0.1"))
             port = int(self._profile_setting("port", 18812))
+            self._close_bridge()
             try:
-                self._client = MetaTrader5(host=host, port=port)
+                self._conn = rpyc.classic.connect(host, port)
+                # Longer than any call-class budget, so the worker-thread timeout
+                # in call() is the one that fires and names the layer.
+                self._conn._config["sync_request_timeout"] = (
+                    max(self._timeout("fast"), self._timeout("history"),
+                        self._timeout("connect")) + 30
+                )
+                self._client = self._conn.modules.MetaTrader5
             except Exception as error:
                 raise BridgeUnavailable(
-                    f"mt5linux server at {host}:{port} is unreachable - is the "
-                    f"unit running? ({error})"
+                    f"RPyC bridge at {host}:{port} is unreachable - is the "
+                    f"mt5linux unit running? ({error})"
                 ) from error
             return
 
@@ -429,9 +455,18 @@ class MT5Connection:
         except ImportError as error:
             raise BridgeUnavailable(
                 "MetaTrader5 is not installed. It is Windows-only; on Linux "
-                "enable broker.mt5.bridge and use mt5linux."
+                "the RPyC bridge is used instead."
             ) from error
         self._client = MetaTrader5
+
+    def _close_bridge(self) -> None:
+        conn = getattr(self, "_conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self._conn = None
 
     def _initialise(self) -> None:
         """Log the terminal in. Credentials are read from the environment only."""
@@ -462,13 +497,36 @@ class MT5Connection:
         path = os.environ.get(f"{prefix}_TERMINAL_PATH")
         if path:
             kwargs["path"] = path
+        # A terminal started with /portable keeps its data beside the exe, and
+        # the IPC endpoint name is derived from that location - so the client
+        # must be told, or it looks for a terminal that does not exist.
+        if os.environ.get(f"{prefix}_PORTABLE", "").strip().lower() in ("1", "true", "yes"):
+            kwargs["portable"] = True
 
         if not self.call("initialize", call_class="connect", **kwargs):
+            # The terminal's own verdict is the useful part: -6 is the broker
+            # refusing the login, -10005 is a terminal with no account to try.
+            code, text = self._last_error_pair()
+            hint = {
+                -6: "the broker rejected the login - check the account still exists",
+                -10005: "the terminal answered but never became ready - it has no "
+                        "account logged in, or is still starting",
+                -10003: "the terminal is not running, or path/portable do not match it",
+            }.get(code, "the terminal must be running and the server string must "
+                        "match the broker exactly")
             raise BridgeUnavailable(
-                f"initialize failed for account {login} on {server}. The terminal "
-                f"must be running and logged in, and the server string must match "
-                f"the broker exactly."
+                f"initialize failed for account {login} on {server}: "
+                f"({code}, {text!r}) - {hint}"
             )
+
+    def _last_error_pair(self) -> tuple[int, str]:
+        """``last_error()`` as ``(code, text)``, tolerant of proxies and failures."""
+        try:
+            value = self._client.last_error()
+            code, text = value[0], value[1]
+            return int(code), str(text)
+        except Exception:
+            return 0, "last_error() unavailable"
 
     # -- handshake (spec step 2) ---------------------------------------------
 

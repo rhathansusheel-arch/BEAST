@@ -26,6 +26,7 @@ from broker.mt5_connection import (
     BridgeCallFailed,
     BridgeMisconfigured,
     BridgeTimeout,
+    BridgeUnavailable,
     ConnectionState,
     MT5Connection,
 )
@@ -321,6 +322,39 @@ def test_misconfiguration_is_typed_separately_from_unavailability(cfg, monkeypat
 
     with pytest.raises(BridgeMisconfigured):
         link._initialise()
+
+
+def test_portable_flag_reaches_initialize(cfg, monkeypatch):
+    monkeypatch.setenv("MT5_GOLD_LOGIN", "778899")
+    monkeypatch.setenv("MT5_GOLD_PASSWORD", "pw")
+    monkeypatch.setenv("MT5_GOLD_SERVER", "Fake-Demo")
+    monkeypatch.setenv("MT5_GOLD_PORTABLE", "1")
+    monkeypatch.setenv("MT5_GOLD_TERMINAL_PATH", r"C:\MT5\terminal64.exe")
+    client = FakeMT5()
+    link = _link(cfg, client)
+    link._injected = False
+    link._start_worker()
+    link._initialise()
+    assert client.init_kwargs["portable"] is True
+    assert client.init_kwargs["path"] == r"C:\MT5\terminal64.exe"
+    assert client.init_kwargs["login"] == 778899
+
+
+def test_initialize_failure_reports_the_terminals_own_error(cfg, monkeypatch):
+    """-6 from the terminal must reach the log verbatim, not a generic hint."""
+    monkeypatch.setenv("MT5_GOLD_LOGIN", "778899")
+    monkeypatch.setenv("MT5_GOLD_PASSWORD", "pw")
+    monkeypatch.setenv("MT5_GOLD_SERVER", "Fake-Demo")
+    client = FakeMT5()
+    client.initialize = lambda **kw: False
+    client.last_error = lambda: (-6, "Terminal: Authorization failed")
+    link = _link(cfg, client)
+    link._injected = False
+    link._start_worker()
+    with pytest.raises(BridgeUnavailable) as error:
+        link._initialise()
+    assert "Authorization failed" in str(error.value)
+    assert "rejected the login" in str(error.value)
 
 
 def test_real_account_never_reaches_order_send(cfg):

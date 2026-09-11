@@ -25,8 +25,10 @@ websocket-client>=1.6.0
 # unconditional entry would make `pip install -r requirements.txt` fail outright
 # on Linux. The marker keeps a Linux host installable.
 MetaTrader5>=5.0.45; sys_platform == "win32"
-# On Linux, install the Wine + rpyc bridge instead and set broker.mt5.bridge:
-#   pip install mt5linux      (it also needs MT5 installed under Wine)
+# On Linux the terminal runs under Wine and broker/mt5_connection.py reaches its
+# MetaTrader5 module over an RPyC classic server (see docs/mt5-bridge.md). Only
+# rpyc is needed on the Linux side; the Wine side has its own requirements file.
+rpyc>=6.0
 
 # --- config / runtime --------------------------------------------------------
 pyyaml>=6.0
