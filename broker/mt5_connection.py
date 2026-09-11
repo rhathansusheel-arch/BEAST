@@ -514,10 +514,13 @@ class MT5Connection:
                 -10003: "the terminal is not running, or path/portable do not match it",
             }.get(code, "the terminal must be running and the server string must "
                         "match the broker exactly")
-            raise BridgeUnavailable(
-                f"initialize failed for account {login} on {server}: "
-                f"({code}, {text!r}) - {hint}"
-            )
+            message = (f"initialize failed for account {login} on {server}: "
+                       f"({code}, {text!r}) - {hint}")
+            if code == -6:
+                # A refused login is a fact about the account, not the pipe.
+                # Retrying it for three minutes only delays the alert.
+                raise BridgeMisconfigured(message)
+            raise BridgeUnavailable(message)
 
     def _last_error_pair(self) -> tuple[int, str]:
         """``last_error()`` as ``(code, text)``, tolerant of proxies and failures."""
