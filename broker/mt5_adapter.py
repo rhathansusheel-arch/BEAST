@@ -341,7 +341,42 @@ class MT5Adapter(BrokerClient):
                 message=f"size {requested} rounds below the minimum {spec.volume_min} lots",
             )
 
+        if self.cfg.is_paper:
+            return self._simulate_fill(request, spec, volume)
+
         return self._send_with_retries(request, spec, volume)
+
+    def _simulate_fill(self, request: OrderRequest, spec: SymbolSpec,
+                       volume: float) -> OrderResult:
+        """Paper mode: price the fill from the live tick, transmit nothing.
+
+        The ``BrokerClient`` contract is that ``place_order`` refuses to
+        transmit while ``mode: paper``, and every other adapter honours it here
+        rather than trusting the runner. This is also what makes paper mode
+        meaningful on MT5: the data is the venue's own tick, the fill is at the
+        touch plus the configured slippage against Beast (soul file 6.8), and
+        the demo account's ledger is never touched. Validation above still ran,
+        so a size or symbol that live mode would refuse is refused on paper too.
+        """
+        tick = self._tick(request.symbol)
+        if tick is None:
+            return OrderResult(False, paper=True,
+                               message="paper fill refused: no live tick to price against")
+
+        is_buy = request.side is OrderSide.BUY
+        touch = float(tick.ask if is_buy else tick.bid)
+        slippage = float(self.cfg.get("broker.paper.slippage_pct", 0.0005))
+        fill = touch * (1.0 + slippage) if is_buy else touch * (1.0 - slippage)
+
+        return OrderResult(
+            accepted=True,
+            order_id=f"paper-{request.tag or request.symbol}",
+            filled_quantity=request.quantity,
+            average_price=round(fill, spec.digits or 2),
+            paper=True,
+            message=f"PAPER fill: {volume} lots of {spec.name} at {fill:.{spec.digits or 2}f} "
+                    f"(live {'ask' if is_buy else 'bid'} {touch}) - nothing transmitted",
+        )
 
     def _send_with_retries(self, request: OrderRequest, spec: SymbolSpec,
                            volume: float) -> OrderResult:

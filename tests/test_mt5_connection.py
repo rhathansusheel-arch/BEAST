@@ -143,7 +143,13 @@ class FakeMT5:
 
 
 def _mt5_config(cfg, **overrides):
-    """Point the config at the fake and shorten every timeout."""
+    """Point the config at the fake and shorten every timeout.
+
+    Runs with both paper switches off so the order-path tests exercise
+    transmission to the FAKE; the paper-mode tests flip ``mode`` back.
+    """
+    cfg.data["mode"] = "live"
+    cfg.section("broker")["paper_trading"] = False
     section = cfg.section("broker")["mt5"]
     section.update({"account_mode": "demo", "active_profile": "gold",
                     "magic": 20260910, "comment_limit": 31, "refresh_bars": 5})
@@ -503,6 +509,52 @@ def test_close_pins_the_position_ticket_on_both_margin_modes(cfg, margin_mode, h
     assert sent["position"] == 99
     assert sent["type"] == FakeMT5.ORDER_TYPE_SELL, "a long is closed by a sell"
     assert sent["volume"] == 0.05
+
+
+# -- paper mode --------------------------------------------------------------
+
+def test_paper_mode_prices_from_the_live_tick_and_transmits_nothing(cfg):
+    """The BrokerClient contract: refuse to transmit while mode is paper."""
+    client = FakeMT5()
+    adapter = MT5Adapter(config=cfg, connection=_connected(cfg, client))
+    cfg.data["mode"] = "paper"
+
+    result = adapter.place_order(OrderRequest(symbol="XAUUSD", side=OrderSide.BUY,
+                                              quantity=1, tag="sig-1"))
+
+    assert result.accepted is True
+    assert result.paper is True
+    assert client.sent == [], "paper mode must never call order_send"
+    assert result.average_price > 2500.45, "a paper buy fills at the ask plus slippage"
+    assert result.order_id == "paper-sig-1"
+
+
+def test_paper_mode_still_refuses_what_live_would_refuse(cfg):
+    """Validation runs before the paper branch, so a bad size is bad on paper too."""
+    client = FakeMT5()
+    adapter = MT5Adapter(config=cfg, connection=_connected(cfg, client))
+    cfg.data["mode"] = "paper"
+
+    result = adapter.place_order(OrderRequest(symbol="XAUUSD", side=OrderSide.BUY,
+                                              quantity=1,
+                                              metadata={"volume_lots": 0.004}))
+    assert result.accepted is False
+    assert client.sent == []
+
+
+def test_bridge_is_chosen_by_platform_when_unset(cfg, monkeypatch):
+    """A null bridge.enabled means Windows -> native, anything else -> mt5linux."""
+    _mt5_config(cfg)
+    cfg.section("broker")["mt5"]["bridge"] = {"enabled": None}
+    link = MT5Connection(profile="gold", config=cfg, client=FakeMT5())
+
+    monkeypatch.setattr("broker.mt5_connection.sys.platform", "linux")
+    assert link._is_bridge() is True
+    monkeypatch.setattr("broker.mt5_connection.sys.platform", "win32")
+    assert link._is_bridge() is False
+
+    cfg.section("broker")["mt5"]["bridge"] = {"enabled": True}
+    assert link._is_bridge() is True, "an explicit setting always wins"
 
 
 # -- interface conformance ---------------------------------------------------

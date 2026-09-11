@@ -53,6 +53,10 @@ def _fill_blockers(cfg: Config) -> Config:
     # same reason it fills the blockers above: these tests exercise the engine,
     # not the operator's current routing.
     cfg.section("broker")["symbols"] = ["XAUUSD", "NIFTY50"]
+    # Likewise the shipped routing sends XAUUSD to the MT5 adapter. The engine
+    # tests drive a recording broker registered under the classic names, so
+    # gold is routed back to the simulator here.
+    cfg.section("broker")["routing"]["XAUUSD"] = "paper"
     return cfg
 
 

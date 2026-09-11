@@ -51,6 +51,7 @@ import pandas as pd
 
 from broker import BrokerClient
 from broker.order_executor import OrderExecutor
+from broker.mt5_adapter import MT5Adapter
 from broker.paper_broker import PaperBroker
 from broker.position_tracker import PositionTracker
 from broker.retry import RetryPolicy, try_call
@@ -160,6 +161,7 @@ class BeastRunner:
         self.brokers: dict[str, BrokerClient] = {
             "zerodha": ZerodhaClient(self.cfg),
             "paper": PaperBroker(self.cfg),
+            "mt5": MT5Adapter(self.cfg),
         }
 
         self.journal = Journal(self.cfg)

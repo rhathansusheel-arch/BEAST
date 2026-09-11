@@ -47,9 +47,10 @@ broker:
   routing:                        # which broker adapter serves which market
     NIFTY50: zerodha
     SENSEX: zerodha
-    XAUUSD: paper                 # simulated. Beast has no live XAUUSD venue yet;
-                                  #   the previous Alpaca route could not trade
-                                  #   XAUUSD or Indian index options at all.
+    XAUUSD: mt5                   # live XAUUSD data from MetaTrader 5. While
+                                  #   `mode: paper`, MT5Adapter prices fills from
+                                  #   the live tick and transmits nothing. Set back
+                                  #   to `paper` for the offline simulator.
   order_type: market              # market | limit - hard-flat always uses market
   paper:
     fill_model: conservative      # soul file 6.8 - never assume the favourable fill
@@ -75,8 +76,9 @@ broker:
         symbols:
           XAUUSD: ""              # "" => discover (XAUUSD / XAUUSD.m / XAUUSDm / GOLD)
     bridge:
-      enabled: false              # true on Linux => mt5linux (Wine + RPyC) instead
-                                  #   of the Windows-only MetaTrader5 package
+      enabled: null               # null => decided by platform: native MetaTrader5
+                                  #   on Windows, mt5linux (Wine + RPyC) elsewhere.
+                                  #   Set true/false only to override that.
     timeouts:                     # nothing may block Beast's loop indefinitely
       fast_seconds: 5             #   ticks, terminal_info, account_info
       history_seconds: 30         #   bar fetches

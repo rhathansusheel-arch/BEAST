@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
@@ -316,9 +317,21 @@ class MT5Connection:
             return value
 
     def _is_bridge(self) -> bool:
-        return bool(self._setting("bridge.enabled", False)) or bool(
-            self._profile_setting("bridge", False)
-        )
+        """Whether to reach MT5 through mt5linux rather than the native package.
+
+        ``broker.mt5.bridge.enabled`` is honoured when set. When it is ``null``
+        the platform decides: the native ``MetaTrader5`` package ships only
+        ``win_amd64`` wheels, so on anything but Windows the bridge is not a
+        preference but the only transport that can exist. Deciding it here
+        means one committed config serves both the Windows dev box and the
+        Linux VPS.
+        """
+        explicit = self._setting("bridge.enabled", None)
+        if explicit is not None:
+            return bool(explicit)
+        if self._profile_setting("bridge", None) is not None:
+            return bool(self._profile_setting("bridge"))
+        return sys.platform != "win32"
 
     # -- session -------------------------------------------------------------
 
