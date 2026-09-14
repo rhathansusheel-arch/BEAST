@@ -138,6 +138,27 @@ class Preflight:
         return Check("clock sync", ok, f"NTP synchronised; |local - server| = {drift:.1f}s "
                                        f"(limit {limit:g}s on a live tick)")
 
+    def check_host_timezone(self) -> Check:
+        """The host clock must be in ``sessions.timezone`` (D-78).
+
+        Beast's session windows, the last-entry cutoff and the flatten time
+        compare a naive ``datetime.now()`` against IST wall-clock times. On a
+        host whose clock is UTC every one of them is five and a half hours
+        off, silently. ``timedatectl set-timezone Asia/Kolkata`` fixes it.
+        """
+        want = str(self.cfg.get("sessions.timezone"))
+        try:
+            from zoneinfo import ZoneInfo
+            now = datetime.now()
+            host_offset = now.astimezone().utcoffset()
+            want_offset = now.replace(tzinfo=ZoneInfo(want)).utcoffset()
+        except Exception as error:
+            return Check("host clock in sessions.timezone", False, str(error))
+        ok = host_offset == want_offset
+        return Check("host clock in sessions.timezone", ok,
+                     f"host UTC{host_offset} vs {want} UTC{want_offset}"
+                     + ("" if ok else f" - run: timedatectl set-timezone {want}"))
+
     def check_disk(self) -> Check:
         need = float(self.cfg.get("ops.min_free_disk_mb", 2048))
         log_dir = Path(str(self.cfg.get("monitoring.log_dir", "./logs")))
@@ -182,6 +203,7 @@ class Preflight:
             self.check_bridge(),
             self.check_symbol(),
             self.check_clock(),
+            self.check_host_timezone(),
             self.check_disk(),
             self.check_kill_flag(),
             self.check_journal(),

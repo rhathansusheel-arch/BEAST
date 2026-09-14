@@ -265,7 +265,10 @@ def preflight(cfg, tmp_path, link=None, ntp=(True, "yes"), disk=10_000, env=None
 
 
 def test_preflight_passes_on_a_healthy_box(cfg, tmp_path):
-    checks = preflight(cfg, tmp_path).run()
+    p = preflight(cfg, tmp_path)
+    # the host-zone check depends on the machine running the tests; pin it
+    p.check_host_timezone = lambda: Check("host clock in sessions.timezone", True, "pinned")
+    checks = p.run()
     assert all(c.ok for c in checks), [c for c in checks if not c.ok]
 
 
@@ -276,8 +279,16 @@ def test_preflight_fails_on_a_blocker(cfg, tmp_path):
 
 
 def test_preflight_fails_on_clock_drift(cfg, tmp_path):
-    assert not preflight(cfg, tmp_path, ntp=(False, "no")).run()[4].ok
-    assert not preflight(cfg, tmp_path, ntp=(None, "no timedatectl")).run()[4].ok
+    assert not preflight(cfg, tmp_path, ntp=(False, "no")).check_clock().ok
+    assert not preflight(cfg, tmp_path, ntp=(None, "no timedatectl")).check_clock().ok
+
+
+def test_preflight_fails_when_the_host_clock_is_not_in_the_session_zone(cfg, tmp_path, monkeypatch):
+    p = preflight(cfg, tmp_path)
+    p.cfg.section("sessions")["timezone"] = "Pacific/Kiritimati"     # UTC+14: matches no host
+    check = p.check_host_timezone()
+    assert not check.ok
+    assert "timedatectl set-timezone" in check.detail
 
 
 def test_preflight_fails_on_low_disk(cfg, tmp_path):

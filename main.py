@@ -49,6 +49,7 @@ import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -979,9 +980,12 @@ class BeastRunner:
 
     def _live_state(self, now: datetime, clean_shutdown: bool) -> dict:
         """The display payload, schema v2. Lists are capped; nothing here is read back."""
+        # Stamp from a real UTC clock and convert, never by labelling a naive
+        # datetime.now() as the session zone - that is only true on a host
+        # whose clock is set to sessions.timezone, and preflight enforces it.
         tz = self.cfg.get("sessions.timezone")
-        local = now if now.tzinfo else pd.Timestamp(now).tz_localize(tz).to_pydatetime()
-        utc = local.astimezone(timezone.utc)
+        utc = datetime.now(timezone.utc)
+        local = utc.astimezone(ZoneInfo(str(tz)))
         cfg = self.cfg
         mt5 = self.brokers.get("mt5")
         link = getattr(mt5, "link", None)
@@ -1031,8 +1035,8 @@ class BeastRunner:
                 closes[role] = frame.index[-1] if frame is not None and len(frame) else None
             markets.append({
                 "market": market,
-                "is_open": bool(clock.is_open(local)),
-                "session_day": clock.session_day(local).isoformat(),
+                "is_open": bool(clock.is_open(now)),
+                "session_day": clock.session_day(now).isoformat(),
                 "phase": row.get("phase"),
                 "last_bar_close_ts": closes,
                 "feed_ok": self._feed_failures.get(market, 0) < FEED_FAILURES_BEFORE_PAUSE,
@@ -1087,7 +1091,7 @@ class BeastRunner:
                 "stop_present_at_broker": broker_stops.get(market, position.current_stop > 0),
                 "trail_armed": bool(position.trail_activated),
                 "trail_level": position.current_stop if position.trail_activated else None,
-                "time_in_trade_seconds": max(0.0, (local.replace(tzinfo=None)
+                "time_in_trade_seconds": max(0.0, (now.replace(tzinfo=None)
                                                    - position.entry_time.replace(tzinfo=None)
                                                    ).total_seconds()),
                 "safe_mode": market in safe_markets,
@@ -1151,7 +1155,7 @@ class BeastRunner:
         }
 
         # -- journal tails (capped) ------------------------------------------
-        day_start = local.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         recent_signals, recent_rejections, todays_trades = [], [], []
         try:
             for row in self.journal.recent_signals(20):
@@ -1163,7 +1167,7 @@ class BeastRunner:
                 recent_rejections.append({"at": row.get("timestamp"), "market": row.get("instrument"),
                                           "gate_id": row.get("failed_gate"),
                                           "reason": row.get("gate_detail")})
-            for row in self.journal.trades_between(day_start, local)[-50:]:
+            for row in self.journal.trades_between(day_start, now)[-50:]:
                 todays_trades.append({"at": row.get("exit_time"), "market": row.get("market"),
                                       "direction": row.get("direction"),
                                       "r_multiple": row.get("r_multiple"),
