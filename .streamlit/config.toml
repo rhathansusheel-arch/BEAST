@@ -1,14 +1,28 @@
-# Streamlit settings for the Beast dashboard.
+# Streamlit settings for the Beast dashboard (D-75).
+#
+# address = "127.0.0.1" is deliberate and is the single source of truth: the
+# dashboard has no authentication of its own, and this box holds the broker
+# credentials. It is reached over an SSH tunnel or the nginx basic-auth proxy.
+# "0.0.0.0" is forbidden in this repo. Do not pass --server.address on the
+# command line either; the config file cannot then be overridden by a stray alias.
 #
 # headless = true skips the first-run email prompt, which otherwise blocks on
-# stdin and kills the process when it is started from a script or a service.
-# The URL is printed either way; open it yourself.
+# stdin and kills the process when it is started from a service.
+
 [server]
-headless = true
+address = "127.0.0.1"
 port = 8501
+headless = true
+enableCORS = false
+enableXsrfProtection = true
+fileWatcherType = "none"
+runOnSave = false
 
 [browser]
 gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
 
 [theme]
 base = "dark"

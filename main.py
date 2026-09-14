@@ -38,14 +38,16 @@ So the loop runs two paths with different cadences and different preconditions:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import shutil
 import signal as os_signal
 import sys
 import time
 import traceback
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -84,7 +86,7 @@ from core.signal_generator import SignalGenerator
 from data.feature_engineering import parse_timeframe
 from data.market_data import MarketDataService
 from ops import EXIT_CLEAN, EXIT_CRASH, EXIT_DELIBERATE_HALT, EXIT_KILL, EXIT_STARTUP_FAILURE
-from ops.heartbeat import Heartbeat, read_heartbeat, write_heartbeat
+from ops.heartbeat import SCHEMA_VERSION, age_seconds, read_live_state, write_json_atomic
 from ops.killswitch import read_flag
 from data.news_calendar import NewsCalendar
 from monitoring.alerts import AlertKind, AlertManager
@@ -223,6 +225,13 @@ class BeastRunner:
         self._exit_code: int | None = None
         self._last_cycle_error: str | None = None
         self._reconcile_report = None
+        self._last_dashboard_state: dict = {}
+        self._last_cycle_ms = 0.0
+        self._heartbeat_write_ms = 0.0
+        self._heartbeat_failures = 0
+        self._heartbeat_warned_at: datetime | None = None
+        self._last_periodic_snapshot: datetime | None = None
+        self._last_snapshot_fingerprint: tuple | None = None
         self._last_review: datetime | None = None
         self._recent_signal_lines: list[str] = []
         self._recent_alert_lines: list[str] = []
@@ -842,6 +851,7 @@ class BeastRunner:
         """
         self.stats.cycles += 1
         self._last_cycle_error = None
+        started = time.monotonic()
         try:
             self._poll_kill_flag(now)
             if not self.running:
@@ -851,6 +861,7 @@ class BeastRunner:
             self._last_cycle_error = f"{type(error).__name__}: {error}"
             raise
         finally:
+            self._last_cycle_ms = (time.monotonic() - started) * 1000.0
             self._write_heartbeat(now)
             self._maybe_periodic_snapshot(now)
 
@@ -874,6 +885,7 @@ class BeastRunner:
         self._check_broker_sessions(now)
         self._maybe_retrain(now)
         self._maybe_weekly_review(now)
+        self._last_dashboard_state = dashboard_state
         self._refresh_dashboard(now, dashboard_state, risk_state)
 
     # -- ops: kill switch, heartbeat, periodic snapshot -----------------------
@@ -938,60 +950,288 @@ class BeastRunner:
             for line in alerts:
                 self._alert(AlertKind.CIRCUIT_BREAKER, market, line, now)
 
-    def _write_heartbeat(self, now: datetime) -> None:
+    def _heartbeat_path(self) -> Path:
         raw = Path(str(self.cfg.get("ops.heartbeat_path", "./heartbeat.json")))
-        path = raw if raw.is_absolute() else PROJECT_ROOT / raw
-        family_pnl = sum(float(s.realised_pnl) for s in self.risk.state.values())
-        open_rows = []
+        return raw if raw.is_absolute() else PROJECT_ROOT / raw
+
+    def _write_heartbeat(self, now: datetime, clean_shutdown: bool = False) -> None:
+        """Publish the live state (D-72). Telemetry never touches the trader.
+
+        Wrapped whole: any failure - a full disk, a NaN in a number, a
+        permission change - is logged at WARNING at most once per five
+        minutes, counted, and otherwise ignored. A dashboard that stops is a
+        dashboard problem; it must never become a trading problem.
+        """
+        started = time.monotonic()
+        try:
+            payload = self._live_state(now, clean_shutdown)
+            write_json_atomic(self._heartbeat_path(), payload)
+            self._heartbeat_write_ms = (time.monotonic() - started) * 1000.0
+        except Exception as error:
+            self._heartbeat_failures += 1
+            last = self._heartbeat_warned_at
+            if last is None or (now - last).total_seconds() >= 300:
+                self._heartbeat_warned_at = now
+                self.logger.warning(
+                    "live state not written (%d failure(s) so far): %s - trading continues",
+                    self._heartbeat_failures, error,
+                )
+
+    def _live_state(self, now: datetime, clean_shutdown: bool) -> dict:
+        """The display payload, schema v2. Lists are capped; nothing here is read back."""
+        tz = self.cfg.get("sessions.timezone")
+        local = now if now.tzinfo else pd.Timestamp(now).tz_localize(tz).to_pydatetime()
+        utc = local.astimezone(timezone.utc)
+        cfg = self.cfg
+        mt5 = self.brokers.get("mt5")
+        link = getattr(mt5, "link", None)
+        facts = getattr(link, "facts", None)
+        rows = self._last_dashboard_state or {}
+        capital = float(self.risk.capital)
+
+        # -- account ---------------------------------------------------------
+        gold_market = next((m for m in self.markets if cfg.market_family(m) == "gold"), None)
+        adapter_name = str(cfg.get("broker.routing").get(gold_market or "XAUUSD", "paper"))
+        broker_equity = None
+        if adapter_name == "mt5" and mt5 is not None and mt5.is_connected():
+            broker_equity = try_call(mt5.capital, "mt5 equity", default=None,
+                                     policy=RetryPolicy(attempts=1))
+        # The account kind is only known once the handshake has verified it.
+        # Until then the page must say "unverified", never guess "demo" or
+        # "live" from a blank default.
+        verified = bool(link is not None and link.state.value == "READY")
+        if verified:
+            account_mode = "demo" if facts.is_demo else "live"
+        else:
+            account_mode = "unverified"
+        account = {
+            "adapter": adapter_name,
+            "server": getattr(facts, "server", None) or None,
+            "company": getattr(facts, "company", None) or None,
+            "account_mode": account_mode,
+            "account_mode_configured": str(cfg.get("broker.mt5.account_mode", "demo")),
+            "account_verified": verified,
+            "currency": (getattr(facts, "currency", None) if verified else None) or cfg.get(
+                "instruments.gold.account_currency", None),
+            "balance": None,
+            "equity": broker_equity,
+            "session_capital": capital,
+            "capital_source": "broker" if (not cfg.is_paper and broker_equity) else "config",
+        }
+
+        # -- markets ---------------------------------------------------------
+        markets = []
+        for market in self.markets:
+            clock = self.clocks[market]
+            row = rows.get(market, {})
+            feed = self.data.feed(market) if hasattr(self.data, "feed") else None
+            closes = {}
+            for role in ("bias", "setup", "trigger"):
+                frame = getattr(feed, "frames", {}).get(role) if feed is not None else None
+                closes[role] = frame.index[-1] if frame is not None and len(frame) else None
+            markets.append({
+                "market": market,
+                "is_open": bool(clock.is_open(local)),
+                "session_day": clock.session_day(local).isoformat(),
+                "phase": row.get("phase"),
+                "last_bar_close_ts": closes,
+                "feed_ok": self._feed_failures.get(market, 0) < FEED_FAILURES_BEFORE_PAUSE,
+                "feed_failure_count": int(self._feed_failures.get(market, 0)),
+                "entry_pause_reason": self._entry_pause_reason.get(market),
+                "regime": {"label": row.get("regime"), "adx": row.get("adx"),
+                           "detail": None},
+                "vol_state": {
+                    "label": row.get("vol_label", "UNKNOWN"),
+                    "probability": row.get("vol_probability", 0.0),
+                    "is_confirmed": row.get("vol_confirmed", False),
+                    "consecutive_bars": row.get("vol_bars", 0),
+                    "is_flickering": row.get("vol_flickering", False),
+                    "size_multiplier": row.get("size_multiplier", 1.0),
+                    "data_delay_minutes": row.get("data_delay_minutes", 0),
+                },
+                "spread": getattr(feed, "spread", None) if feed is not None else None,
+            })
+
+        # -- positions -------------------------------------------------------
+        positions = []
+        open_risk = 0.0
+        report = self._reconcile_report
+        safe_markets = set(getattr(report, "safe_mode", {}) or {})
+        broker_stops = {p.market: p.stop_present
+                        for p in (getattr(report, "positions", None) or [])}
         for market in self.positions.open_markets():
             position = self.positions.get(market)
             if position is None:
                 continue
             leg = position.signal.futures_leg
-            open_rows.append({
+            volume = (leg.volume_lots if leg and leg.is_cfd else
+                      (leg.contracts if leg else (position.signal.option_leg.lots
+                                                  if position.signal.option_leg else 0)))
+            price = position.last_underlying or position.entry_underlying
+            mult = leg.size_multiplier if leg else 1.0
+            unrealised = (price - position.entry_underlying) * position.direction.sign * mult
+            at_stop = abs(position.entry_underlying - position.current_stop) * mult \
+                if position.current_stop else 0.0
+            open_risk += at_stop
+            positions.append({
                 "market": market,
                 "direction": position.direction.value,
-                "volume": leg.volume_lots if leg and leg.is_cfd else
-                          (leg.contracts if leg else (position.signal.option_leg.lots
-                                                      if position.signal.option_leg else 0)),
-                "sl_present": position.current_stop > 0,
-                "stop": position.current_stop,
+                "volume": volume,
+                "entry_price": position.entry_underlying,
+                "entry_time": position.entry_time,
+                "current_price": price,
+                "unrealised_pnl": round(unrealised, 2),
+                "unrealised_r": round(position.r_at(price), 4),
+                "stop_price": position.current_stop,
+                "target_price": position.plan.target_price,
+                "stop_present_at_broker": broker_stops.get(market, position.current_stop > 0),
+                "trail_armed": bool(position.trail_activated),
+                "trail_level": position.current_stop if position.trail_activated else None,
+                "time_in_trade_seconds": max(0.0, (local.replace(tzinfo=None)
+                                                   - position.entry_time.replace(tzinfo=None)
+                                                   ).total_seconds()),
+                "safe_mode": market in safe_markets,
             })
-        mt5 = self.brokers.get("mt5")
-        write_heartbeat(path, Heartbeat(
-            written_at=now.isoformat(timespec="seconds"),
-            pid=os.getpid(),
-            mode=self.cfg.mode,
-            markets=list(self.markets),
-            loop_cycle_count=self.stats.cycles,
-            open_positions=open_rows,
-            feed_ok={m: self._feed_failures.get(m, 0) < FEED_FAILURES_BEFORE_PAUSE
-                     for m in self.markets},
-            entry_pause_reason=dict(self._entry_pause_reason),
-            last_error=self._last_cycle_error,
-            session_day=next((str(s.session_day) for s in self.risk.state.values()
-                              if s.session_day), None),
-            capital=float(self.risk.capital),
-            realised_pnl_today=family_pnl,
-            clean_shutdown=False,
-            mt5_state=getattr(getattr(mt5, "link", None), "state", None).value
-            if mt5 is not None and getattr(mt5, "link", None) is not None else None,
-        ))
+
+        # -- risk ------------------------------------------------------------
+        family_states = list(self.risk.state.values())
+        realised = sum(float(s.realised_pnl) for s in family_states)
+        cap_pct = 0.0
+        cap_amount = 0.0
+        for market in self.markets:
+            try:
+                cap_pct = max(cap_pct, float(cfg.daily_loss_cap(market)))
+            except Exception:
+                pass
+        cap_amount = capital * cap_pct
+        paused = [s for s in family_states if s.paused]
+        caps = cfg.get("risk.max_concurrent") or {}
+        risk = {
+            "realised_pnl_today": round(realised, 2),
+            "daily_loss_cap_amount": round(cap_amount, 2),
+            "daily_loss_cap_pct_used": round(max(0.0, -realised) / cap_amount, 4) if cap_amount else 0.0,
+            "consecutive_losses": max((int(s.consecutive_losses) for s in family_states), default=0),
+            "consecutive_loss_trigger": int(cfg.get("risk.consecutive_loss_trigger", 3)),
+            "open_risk_amount": round(open_risk, 2),
+            "open_risk_pct": round(open_risk / capital, 4) if capital else 0.0,
+            "concurrent_open": len(positions),
+            "concurrent_max": int(sum(int(v) for v in caps.values())) if caps else 0,
+            "session_paused": bool(paused),
+            "pause_reason": paused[0].pause_reason if paused else None,
+        }
+
+        # -- system ----------------------------------------------------------
+        kill = read_flag(self._kill_flag_path())
+        log_dir = Path(str(cfg.get("monitoring.log_dir", "./logs")))
+        log_dir = log_dir if log_dir.is_absolute() else PROJECT_ROOT / log_dir
+        try:
+            free_mb = shutil.disk_usage(log_dir if log_dir.exists() else PROJECT_ROOT).free / 2**20
+        except OSError:
+            free_mb = None
+        system = {
+            "brokers": [{"name": name, "connected": bool(b.is_connected()),
+                         "state": (getattr(getattr(b, "link", None), "state", None).value
+                                   if getattr(b, "link", None) is not None else None),
+                         "last_error": None}
+                        for name, b in self.brokers.items()],
+            "bridge_ok": bool(link is not None and link.state.value in ("READY", "DEGRADED")),
+            "circuit_breakers": {
+                "session_pause": bool(paused),
+                "feed_pause": {m: r for m, r in self._entry_pause_reason.items()
+                               if "feed" in r.lower()},
+                "error_streak": int(self._error_streak),
+            },
+            "kill_flag": ({k: kill.get(k) for k in ("mode", "reason", "set_by", "set_at")}
+                          if kill else None),
+            "last_error": ({"message": self._last_cycle_error, "market": None,
+                            "at": utc} if self._last_cycle_error else None),
+            "error_streak": int(self._error_streak),
+            "log_dir_free_mb": round(free_mb, 1) if free_mb is not None else None,
+            "heartbeat_write_failures": int(self._heartbeat_failures),
+        }
+
+        # -- journal tails (capped) ------------------------------------------
+        day_start = local.replace(hour=0, minute=0, second=0, microsecond=0)
+        recent_signals, recent_rejections, todays_trades = [], [], []
+        try:
+            for row in self.journal.recent_signals(20):
+                recent_signals.append({"at": row.get("timestamp_ist"), "market": row.get("market"),
+                                       "direction": row.get("direction"),
+                                       "setup_type": row.get("setup_type"),
+                                       "reason_line": row.get("reason_line")})
+            for row in self.journal.recent_rejections(50):
+                recent_rejections.append({"at": row.get("timestamp"), "market": row.get("instrument"),
+                                          "gate_id": row.get("failed_gate"),
+                                          "reason": row.get("gate_detail")})
+            for row in self.journal.trades_between(day_start, local)[-50:]:
+                todays_trades.append({"at": row.get("exit_time"), "market": row.get("market"),
+                                      "direction": row.get("direction"),
+                                      "r_multiple": row.get("r_multiple"),
+                                      "exit_reason": row.get("exit_reason"),
+                                      "pnl": (json.loads(row.get("payload") or "{}")
+                                              .get("realised_pnl"))})
+        except Exception as error:
+            self.logger.debug("journal tails unavailable for live state: %s", error)
+
+        broker_time = None
+        if facts is not None and link is not None and link.state.value == "READY":
+            broker_time = (utc + timedelta(hours=float(facts.server_utc_offset_hours)))
+
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "written_at": utc,
+            "written_at_local": local,
+            "broker_server_time": broker_time,
+            "pid": os.getpid(),
+            "uptime_seconds": round((datetime.now() - self.stats.started_at).total_seconds(), 1),
+            "cycle_count": int(self.stats.cycles),
+            "loop_interval_seconds": float(self._loop_interval()),
+            "last_cycle_duration_ms": round(self._last_cycle_ms, 1),
+            "heartbeat_write_ms": round(self._heartbeat_write_ms, 2),
+            "mode": cfg.mode,
+            "clean_shutdown": bool(clean_shutdown),
+            "account": account,
+            "markets": markets,
+            "positions": positions,
+            "risk": risk,
+            "system": system,
+            "recent_signals": recent_signals,
+            "recent_rejections": recent_rejections,
+            "todays_trades": todays_trades,
+        }
+
+    def _state_fingerprint(self) -> tuple:
+        """What a recovery snapshot must not be more than seconds behind (D-73)."""
+        return (
+            tuple(sorted(self.positions.open_markets())),
+            tuple(sorted((m, round(p.current_stop, 6), bool(p.trail_activated))
+                         for m in self.positions.open_markets()
+                         if (p := self.positions.get(m)) is not None)),
+            tuple(sorted((f, s.paused, str(s.session_day)) for f, s in self.risk.state.items())),
+            tuple(sorted(self._entry_pause_reason.items())),
+        )
 
     def _maybe_periodic_snapshot(self, now: datetime) -> None:
-        """Keep ``state_snapshot.json`` current while the loop runs (D-65).
+        """Keep ``state_snapshot.json`` current while the loop runs (D-65, D-73).
 
-        Written on the heartbeat cadence with ``in_progress=True`` so the
-        dashboard shows this session's equity and positions rather than last
-        night's, and so a later ``clean_exit=False`` still means what it says.
+        Written every ``ops.snapshot_interval_seconds`` with ``in_progress``
+        set, and **immediately** whenever the recovery-relevant state changes:
+        a position opened or closed, a stop ratcheted or a trail armed, a
+        circuit breaker tripped or cleared, a session rolled. A hard kill then
+        loses seconds of recovery state, not a session. ``clean_exit`` stays
+        false on every one of these; only ``shutdown()`` may set it.
         """
-        every = float(self.cfg.get("ops.snapshot_every_seconds", 30))
-        last = getattr(self, "_last_periodic_snapshot", None)
-        if last is not None and (now - last).total_seconds() < every:
+        every = float(self.cfg.get("ops.snapshot_interval_seconds", 60))
+        fingerprint = self._state_fingerprint()
+        changed = fingerprint != self._last_snapshot_fingerprint
+        last = self._last_periodic_snapshot
+        due = last is None or (now - last).total_seconds() >= every
+        if not (changed or due):
             return
         self._last_periodic_snapshot = now
+        self._last_snapshot_fingerprint = fingerprint
         try:
-            self._save_snapshot(clean_exit=False, in_progress=True, quiet=True)
+            self._save_snapshot(clean_exit=False, in_progress=True, quiet=not changed)
         except Exception as error:
             self.logger.warning("periodic snapshot failed: %s", error)
 
@@ -1643,20 +1883,11 @@ class BeastRunner:
 
         self._save_snapshot(clean_exit=clean)
         self._print_session_summary(now)
-        self.journal.close()
         if clean:
             # The watchdog reads this: an intentional stop is not to be undone.
-            try:
-                self._last_cycle_error = None
-                self._write_heartbeat(now)
-                raw = Path(str(self.cfg.get("ops.heartbeat_path", "./heartbeat.json")))
-                path = raw if raw.is_absolute() else PROJECT_ROOT / raw
-                beat = read_heartbeat(path)
-                if beat is not None:
-                    beat.clean_shutdown = True
-                    write_heartbeat(path, beat)
-            except Exception as error:
-                self.logger.warning("final heartbeat failed: %s", error)
+            self._last_cycle_error = None
+            self._write_heartbeat(now, clean_shutdown=True)
+        self.journal.close()
         self.logger.info("stopped")
 
     def _save_snapshot(self, clean_exit: bool, in_progress: bool = False,
@@ -1943,16 +2174,30 @@ def cmd_dashboard(cfg: Config) -> int:
         journal.close()
 
     print()
-    print(f"snapshot written {snapshot.written_at} | clean_exit={snapshot.clean_exit}")
-    if not snapshot.clean_exit:
+    live = bool(getattr(snapshot, "in_progress", False))
+    try:
+        age = datetime.now() - datetime.fromisoformat(snapshot.written_at)
+        age_text = f"{int(age.total_seconds())}s ago"
+    except (TypeError, ValueError):
+        age_text = "unknown age"
+    print(f"snapshot written {snapshot.written_at} ({age_text}) | "
+          f"{'mid-session' if live else 'at shutdown'} | clean_exit={snapshot.clean_exit}")
+    if not live and not snapshot.clean_exit:
         print("  the run that wrote this did NOT shut down cleanly")
     if snapshot.session_summary:
         print("last session:")
         for key, value in snapshot.session_summary.items():
             print(f"  {key}: {value}")
+
+    raw = Path(str(cfg.get("ops.heartbeat_path", "./heartbeat.json")))
+    hb_path = raw if raw.is_absolute() else PROJECT_ROOT / raw
+    hb_age = age_seconds(read_live_state(hb_path))
+    hb_text = (f"live state {hb_path.name} is {hb_age:.0f}s old" if hb_age is not None
+               else f"no live state file at {hb_path}")
     print(
-        "\nThis is the persisted state, not a live feed. Beast has no control "
-        "socket to attach to."
+        f"\nThis is persisted state read from disk, {age_text} - Beast writes it every "
+        f"{cfg.get('ops.snapshot_interval_seconds', 60)}s and on every state change "
+        f"while running; {hb_text}. There is no control socket to attach to (D-37)."
     )
     return 0
 

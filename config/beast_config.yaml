@@ -462,7 +462,10 @@ backtest:
 # monitoring
 # ------------------------------------------------------------------------------
 monitoring:
-  dashboard_refresh_seconds: 5
+  dashboard_refresh_seconds: 5      # terminal panel AND the browser fragments (D-74)
+  dashboard_log_tail_kb: 256        # CONFIRM - D-74: the browser reads only this much of
+                                    #   each 10 MB log stream, from the end
+  dashboard_journal_ttl_seconds: 30 # CONFIRM - D-74: journal aggregates are cached this long
   alert_rate_limit_minutes: 15
   log_dir: ./logs
   log_level: INFO
@@ -485,9 +488,12 @@ monitoring:
 ops:
   reconcile_match_threshold: 0.7     # CONFIRM - below this a venue position gets SAFE mode
   safe_mode_stop_atr_multiple: 2.0   # CONFIRM - SAFE-mode stop at entry +/- N x ATR(setup TF)
-  heartbeat_path: ./heartbeat.json   # CONFIRM
+  heartbeat_path: ./heartbeat.json   # CONFIRM - D-72: the ONE live-state file; watchdog and
+                                     #   dashboard both read it; the trading loop never does
   heartbeat_stale_seconds: 90        # CONFIRM - watchdog restarts Beast past this (after one re-read)
-  snapshot_every_seconds: 30         # CONFIRM - periodic state_snapshot.json for the dashboard
+  snapshot_interval_seconds: 60      # CONFIRM - D-73: state_snapshot.json (RECOVERY) is also
+                                     #   written this often mid-session, and immediately on any
+                                     #   position/stop/trail/breaker/session change
   kill_flag_path: ./KILL             # CONFIRM - written by `python -m ops.killswitch`
   kill_default_mode: halt            # CONFIRM - halt (entries off, exits run) | flatten
   max_restarts: 3                    # CONFIRM - watchdog crash-loop guard ...

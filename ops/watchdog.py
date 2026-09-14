@@ -39,7 +39,7 @@ import sys
 import time
 import urllib.request
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -66,7 +66,7 @@ class Watchdog:
 
     def __init__(self, cfg, alerts, systemctl: Callable[[str, str], bool] | None = None,
                  exit_status: Callable[[str], int | None] | None = None,
-                 now: Callable[[], datetime] = datetime.now,
+                 now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  tcp_check: Callable[[str, int], bool] | None = None,
                  http_check: Callable[[str], bool] | None = None,
                  terminal_check: Callable[[], bool | None] | None = None) -> None:
@@ -184,9 +184,17 @@ class Watchdog:
 
     def _age(self, beat: Heartbeat) -> float:
         try:
-            return (self.now() - datetime.fromisoformat(beat.written_at)).total_seconds()
+            stamp = datetime.fromisoformat(beat.written_at)
         except (TypeError, ValueError):
             return float("inf")
+        now = self.now()
+        # v2 stamps are UTC with tzinfo; a v1 or test stamp is naive. Compare
+        # like with like rather than raising on the mix.
+        if stamp.tzinfo is not None and now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        elif stamp.tzinfo is None and now.tzinfo is not None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return (now - stamp).total_seconds()
 
     @staticmethod
     def _position_note(beat: Heartbeat | None) -> str:

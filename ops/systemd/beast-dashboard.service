@@ -1,14 +1,30 @@
-# Read-only Streamlit view, bound to loopback. Reach it over an SSH tunnel
-# (ssh -L 8501:127.0.0.1:8501 root@host) or the nginx basic-auth proxy on :80.
+# Read-only Streamlit view (D-75). Bound to 127.0.0.1 by .streamlit/config.toml -
+# the single source of truth; nothing on this command line may override it.
+# Reach it over an SSH tunnel (docs/vps-ops.md) or the nginx basic-auth proxy.
+#
+# Runs as its own user with READ access to the state and journal directories
+# and no write access to either. It cannot touch an order: the process holds
+# no broker handle and the app has no code path to one (tests/test_live_state.py).
 [Unit]
 Description=Beast: read-only Streamlit dashboard (127.0.0.1 only)
-After=network.target
+After=beast.service network.target
+Wants=beast.service
 
 [Service]
+User=beastview
+Group=beast
 WorkingDirectory=/home/beast-agent
-ExecStart=/home/beast-agent/venv/bin/python -m streamlit run monitoring/streamlit_app.py --server.headless true --server.address 127.0.0.1 --server.port 8501 --browser.gatherUsageStats false
+Environment=HOME=/home/beastview
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/beast-agent/venv/bin/streamlit run monitoring/streamlit_app.py
 Restart=always
-RestartSec=5
+RestartSec=10
+# hardening: nothing writable but its own home (Streamlit keeps a small cache there)
+ProtectSystem=strict
+ReadWritePaths=/home/beastview
+ProtectHome=read-only
+NoNewPrivileges=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

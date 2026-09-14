@@ -258,6 +258,24 @@ class Journal:
         with closing(self._conn.cursor()) as cursor:
             return int(cursor.execute(query, params).fetchone()["n"])
 
+    def recent_signals(self, limit: int = 20) -> list[dict[str, Any]]:
+        """The newest signals, for the live-state tail."""
+        with closing(self._conn.cursor()) as cursor:
+            rows = cursor.execute(
+                "SELECT signal_id, timestamp_ist, market, direction, setup_type, reason_line "
+                "FROM signals ORDER BY timestamp_ist DESC LIMIT ?", (int(limit),)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def recent_rejections(self, limit: int = 50) -> list[dict[str, Any]]:
+        """The newest rejections, for the live-state tail."""
+        with closing(self._conn.cursor()) as cursor:
+            rows = cursor.execute(
+                "SELECT timestamp, instrument, direction, failed_gate, gate_detail "
+                "FROM rejections ORDER BY id DESC LIMIT ?", (int(limit),)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def open_signals_without_trades(self) -> list[dict[str, Any]]:
         """Signals with no matching trade row - used to reconcile after a restart."""
         with closing(self._conn.cursor()) as cursor:

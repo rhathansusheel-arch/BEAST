@@ -20,7 +20,7 @@ T0 = datetime(2026, 9, 14, 12, 0, 0)
 
 def beat(age_s=0, **kw) -> Heartbeat:
     base = dict(written_at=(T0 - timedelta(seconds=age_s)).isoformat(timespec="seconds"),
-                pid=1, mode="paper", markets=["XAUUSD"], loop_cycle_count=1)
+                pid=1, loop_cycle_count=1)
     base.update(kw)
     return Heartbeat(**base)
 
@@ -62,25 +62,46 @@ def test_heartbeat_roundtrip_is_atomic_and_tolerant(tmp_path):
     assert not path.with_suffix(".json.tmp").exists()
     got = read_heartbeat(path)
     assert got is not None and got.last_error == "boom" and got.clean_shutdown is False
-    path.write_text('{"written_at": "x", "unknown_key": 1, "pid": 2, "mode": "paper", '
-                    '"markets": [], "loop_cycle_count": 0}')
+    path.write_text('{"written_at": "x", "unknown_key": 1, "pid": 2, "cycle_count": 0}')
     assert read_heartbeat(path) is not None, "unknown keys are ignored, not fatal"
 
 
-def test_runner_writes_a_heartbeat_even_when_the_cycle_raises(cfg, tmp_path, monkeypatch):
+def bare_runner(cfg, tmp_path):
+    """A BeastRunner with just enough state for tick()'s ops hooks."""
     from main import BeastRunner
     import logging
     c = ops_cfg(cfg, tmp_path)
+    c.section("broker")["symbols"] = ["XAUUSD"]
     runner = BeastRunner.__new__(BeastRunner)
     runner.cfg = c; runner.markets = ["XAUUSD"]; runner.brokers = {}
-    runner.stats = SimpleNamespace(cycles=0, errors=0)
+    runner.stats = SimpleNamespace(cycles=0, errors=0, started_at=T0)
     runner.risk = SimpleNamespace(state={}, capital=1.0)
     runner.positions = SimpleNamespace(open_markets=lambda: [], get=lambda m: None)
+    runner.clocks = {"XAUUSD": SimpleNamespace(is_open=lambda now: False,
+                                                session_day=lambda now: T0.date())}
+    runner.data = SimpleNamespace(feed=lambda m: None)
+    runner.journal = SimpleNamespace(recent_signals=lambda n: [], recent_rejections=lambda n: [],
+                                     trades_between=lambda a, b: [])
     runner._feed_failures = {}; runner._entry_pause_reason = {}; runner._kill_mode = None
     runner._last_cycle_error = None; runner.running = True; runner._exit_code = None
+    runner._reconcile_report = None; runner._last_dashboard_state = {}
+    runner._last_cycle_ms = 0.0; runner._heartbeat_write_ms = 0.0
+    runner._heartbeat_failures = 0; runner._heartbeat_warned_at = None
+    runner._error_streak = 0
+    runner._loop_interval = lambda: 5.0
     runner.logger = logging.getLogger("t")
-    runner._tick_body = lambda now: (_ for _ in ()).throw(RuntimeError("cycle exploded"))
     runner._maybe_periodic_snapshot = lambda now: None
+    # the per-cycle helpers _tick_body calls after the market loop
+    for name in ("_check_circuit_breakers", "_check_broker_sessions", "_maybe_retrain",
+                 "_maybe_weekly_review"):
+        setattr(runner, name, lambda now: None)
+    runner._refresh_dashboard = lambda now, d, r: None
+    return runner
+
+
+def test_runner_writes_a_heartbeat_even_when_the_cycle_raises(cfg, tmp_path):
+    runner = bare_runner(cfg, tmp_path)
+    runner._tick_body = lambda now: (_ for _ in ()).throw(RuntimeError("cycle exploded"))
 
     with pytest.raises(RuntimeError):
         runner.tick(T0)
@@ -160,13 +181,8 @@ def test_restart_alert_names_an_open_position(cfg, tmp_path):
 # -- kill switch -----------------------------------------------------------------
 
 def test_halt_pauses_entries_and_leaves_exits_running(cfg, tmp_path):
-    from main import BeastRunner
-    import logging
-    c = ops_cfg(cfg, tmp_path)
-    runner = BeastRunner.__new__(BeastRunner)
-    runner.cfg = c; runner.markets = ["XAUUSD"]; runner._entry_pause_reason = {}
-    runner._kill_mode = None; runner.running = True; runner._exit_code = None
-    runner.logger = logging.getLogger("t"); runner._alert = lambda *a, **k: None
+    runner = bare_runner(cfg, tmp_path)
+    runner._alert = lambda *a, **k: None
     runner.positions = SimpleNamespace(open_markets=lambda: ["XAUUSD"])
 
     set_flag(tmp_path / "KILL", "halt", "test")
@@ -189,9 +205,6 @@ def test_flatten_refuses_without_the_section_8_phrase(tmp_path):
 
 
 def test_flatten_goes_through_the_override_guard_and_exits_3(cfg, tmp_path):
-    from main import BeastRunner
-    import logging
-    c = ops_cfg(cfg, tmp_path)
     closed = []
 
     class Guard:
@@ -199,10 +212,8 @@ def test_flatten_goes_through_the_override_guard_and_exits_3(cfg, tmp_path):
             ok = request.confirmation_text == FLATTEN_PHRASE
             return SimpleNamespace(accepted=ok, message="ok" if ok else "refused", record="rec")
 
-    runner = BeastRunner.__new__(BeastRunner)
-    runner.cfg = c; runner.markets = ["XAUUSD"]; runner._entry_pause_reason = {}
-    runner._kill_mode = None; runner.running = True; runner._exit_code = None
-    runner.logger = logging.getLogger("t"); runner._alert = lambda *a, **k: None
+    runner = bare_runner(cfg, tmp_path)
+    runner._alert = lambda *a, **k: None
     runner.overrides = Guard()
     pos = SimpleNamespace(last_underlying=2500.0, entry_underlying=2500.0)
     runner.positions = SimpleNamespace(

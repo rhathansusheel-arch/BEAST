@@ -142,6 +142,66 @@ The whole report is logged at ERROR when anything was repaired or disagreed.
 `python -m ops.watchdog --once` and `journalctl -u beast -n 60` are the two
 commands to read after any restart.
 
+## The dashboard: live, and reachable without opening a port
+
+Beast writes `heartbeat.json` at the end of **every** cycle (D-72) - open
+positions, equity, risk headroom, regime and `vol_state`, the system state,
+and short tails of signals, rejections and today's trades. The Streamlit
+app reads that file fresh every `monitoring.dashboard_refresh_seconds` and
+caches only the journal aggregates (`dashboard_journal_ttl_seconds`). It
+does not attach to the process (D-37, D-53) and has no button that touches
+an order (D-54).
+
+**The status pill at the top is the point of the page.** Against the loop
+interval: under 2x is **LIVE** (green), 2-6x **LAGGING** (amber, age shown),
+beyond **STALE** (red banner, every number dimmed), no file or unparseable
+**DOWN** (red banner, no numbers at all), a KILL flag **HALTED** (purple,
+who and why), a clean shutdown **STOPPED** (grey). A closed market with a
+fresh file is "LIVE / market closed"; a closed market with a stale file is
+DOWN. The absolute `written_at` sits next to the age, always, and the MT5
+server clock's drift from the host is shown in the header.
+
+### Reaching it - path A, an SSH tunnel (recommended)
+
+Nothing new listens on the public interface. In `~/.ssh/config` on the laptop:
+
+```
+Host beast
+    HostName 200.141.7.185
+    User root
+    LocalForward 8501 127.0.0.1:8501
+    ServerAliveInterval 30
+    ServerAliveCountMax 3
+```
+
+Then `ssh -N beast` and open <http://localhost:8501>. On a phone, an SSH
+client with port forwarding (Termius, a-Shell, Blink) does the same.
+
+### Path B - nginx on :80 with basic auth (already in place)
+
+`/etc/nginx/sites-available/beast-dashboard` proxies :80 to 127.0.0.1:8501
+with the WebSocket upgrade headers (without them Streamlit sits on "Please
+wait..." forever) and `auth_basic` from `/etc/nginx/.htpasswd`. Change the
+password with `htpasswd /etc/nginx/.htpasswd beast`. TLS needs a hostname
+for certbot; this box has only an IP, so :80 stays plain HTTP - use the
+tunnel for anything you would not say over the air. `fail2ban` watches the
+nginx auth log.
+
+### The unit
+
+`beast-dashboard.service` runs `streamlit run monitoring/streamlit_app.py`
+as user **`beastview`**, a member of group `beast` with read access to the
+checkout, the journal and `heartbeat.json`, and write access only to its own
+home. `.streamlit/config.toml` binds `127.0.0.1`; the command line passes
+no address so nothing can override it. `ss -tlnp | grep 8501` must show
+`127.0.0.1:8501` and nothing on `0.0.0.0`.
+
+```bash
+systemctl status beast-dashboard          # state
+journalctl -u beast-dashboard -n 50       # logs
+systemctl restart beast-dashboard         # after a deploy
+```
+
 ## On the local Windows box
 
 The same `ops/` package runs there for development; only `systemctl` and
