@@ -139,6 +139,7 @@ class SessionFacts:
 
     login: int = 0
     server: str = ""
+    company: str = ""
     currency: str = ""
     is_demo: bool = False
     margin_mode: int = -1
@@ -554,6 +555,7 @@ class MT5Connection:
         account = self.call("account_info", call_class="connect")
         facts.login = int(getattr(account, "login", 0) or 0)
         facts.server = str(getattr(account, "server", ""))
+        facts.company = str(getattr(account, "company", ""))
         facts.currency = str(getattr(account, "currency", ""))
         if not bool(getattr(account, "trade_allowed", False)):
             raise BridgeUnavailable(f"trading is disabled on account {facts.login}")

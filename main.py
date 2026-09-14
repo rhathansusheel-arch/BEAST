@@ -297,12 +297,17 @@ class BeastRunner:
         self._fill_contract_specs()
 
     def _fill_contract_specs(self) -> None:
-        """Read lot size and strike interval from the broker (open item 18).
+        """Read contract specs from the broker (open items 17 and 18).
 
-        Both change by exchange notification, so the broker's contract master is
-        the better source. Config remains the override: a value already set is
-        never replaced.
+        They change by exchange or broker notification, so the venue is the
+        better source. Config remains the override: a value already set is
+        never replaced, and a broker that cannot be reached leaves a ``null``
+        as ``null`` - gold stays refused rather than guessed at.
         """
+        self._fill_indian_specs()
+        self._fill_gold_specs()
+
+    def _fill_indian_specs(self) -> None:
         zerodha = self.brokers.get("zerodha")
         if zerodha is None or not zerodha.is_connected():
             return
@@ -323,6 +328,100 @@ class BeastRunner:
                         "%s.%s read from the broker contract master: %s",
                         key, field_name, specs[field_name],
                     )
+
+    #: instruments.gold key -> attribute of broker.mt5_connection.SymbolSpec
+    GOLD_SPEC_FIELDS = {
+        "symbol": "name",
+        "contract_multiplier": "contract_size",
+        "tick_size": "tick_size",
+        "tick_value": "tick_value",
+        "point": "point",
+        "volume_min": "volume_min",
+        "volume_step": "volume_step",
+        "volume_max": "volume_max",
+        "stops_level_points": "stops_level",
+        "filling_mode": "filling_mask",
+    }
+
+    def _fill_gold_specs(self) -> None:
+        """Populate ``instruments.gold`` from the live MT5 symbol (D-56).
+
+        Every value is logged with its source so a fill that looks wrong later
+        can be traced in one line. On a reconnect the broker's numbers are
+        compared with what was read before; a change is logged as an error and
+        **not** applied, because a symbol that was silently resized between
+        sessions is exactly what an operator must be told about.
+        """
+        mt5 = self.brokers.get("mt5")
+        if mt5 is None or not mt5.is_connected():
+            return
+        gold = next((m for m in self.markets if self.cfg.market_family(m) == "gold"), None)
+        if gold is None:
+            return
+        key = self.cfg.instrument_key(gold)
+        section = self.cfg.section("instruments")[key]
+        if str(section.get("trade")) != "cfd":
+            return
+        if not section.get("prefer_broker_contract_master", True):
+            self.logger.info("%s: prefer_broker_contract_master is off; config values only", key)
+            return
+
+        spec = mt5.link.spec(gold)
+        facts = mt5.link.facts
+        if spec is None:
+            self.logger.error("%s: MT5 is connected but has no symbol for %s; specs stay unset",
+                              key, gold)
+            return
+
+        read: dict[str, object] = {
+            name: getattr(spec, attr) for name, attr in self.GOLD_SPEC_FIELDS.items()
+        }
+        if facts.company or facts.server:
+            read["venue"] = f"{facts.company} / {facts.server}".strip(" /")
+
+        previous = getattr(self, "_gold_specs_from_broker", None)
+        if previous is not None:
+            changed = {k: (previous[k], v) for k, v in read.items()
+                       if k in previous and previous[k] != v}
+            for name, (old, new) in changed.items():
+                self.logger.error(
+                    "%s.%s CHANGED at the broker between sessions: %s -> %s. Not applied; "
+                    "restart Beast after confirming the new value.", key, name, old, new,
+                )
+            if changed:
+                self.alerts.circuit_breaker(gold, "broker changed the gold contract specs",
+                                            tripped=True)
+            return
+        self._gold_specs_from_broker = read
+
+        for name, value in read.items():
+            if section.get(name) is not None:
+                self.logger.info("gold.%s = %s (config)", name, section[name])
+                continue
+            if value in (None, "", 0, 0.0):
+                self.logger.warning("gold.%s: broker reported %r; left unset", name, value)
+                continue
+            section[name] = value
+            self.logger.info("gold.%s = %s (broker)", name, value)
+
+        # D-58: tick_value is in the account currency; sizing must know it.
+        if facts.currency:
+            self.risk.broker_currency["gold"] = facts.currency
+            declared = section.get("account_currency")
+            if declared is None:
+                self.logger.error(
+                    "gold.account_currency is unset; the broker reports %s. Set it to the "
+                    "currency risk.capital is stated in - gold is refused until it matches.",
+                    facts.currency,
+                )
+            elif str(declared).upper() != facts.currency.upper():
+                self.logger.error(
+                    "gold.account_currency is %s but the broker account is %s. Gold trades "
+                    "are refused: no conversion rate is assumed (D-58).",
+                    declared, facts.currency,
+                )
+            else:
+                self.logger.info("gold.account_currency = %s (config, matches broker)", declared)
 
     # -- 3. market hours -----------------------------------------------------
 

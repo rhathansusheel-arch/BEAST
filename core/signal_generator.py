@@ -308,6 +308,7 @@ class SignalGenerator:
 
         if selection.futures_leg is not None:
             selection.futures_leg.contracts = sized.quantity
+            selection.futures_leg.volume_lots = sized.volume_lots
 
         return setup, plan, confluence, selection, sized
 

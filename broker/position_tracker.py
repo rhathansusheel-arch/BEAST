@@ -309,7 +309,7 @@ class PositionTracker:
             gross = (exit_premium - (position.entry_premium or 0.0)) * quantity
         elif signal.futures_leg:
             points = (exit_underlying - position.entry_underlying) * position.direction.sign
-            gross = points * signal.futures_leg.contract_multiplier * quantity
+            gross = points * signal.futures_leg.size_multiplier * quantity
         else:
             gross = 0.0
         return round(gross - trade.costs, 2)

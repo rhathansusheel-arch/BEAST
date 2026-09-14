@@ -76,6 +76,9 @@ class RiskManager:
             family: MarketRiskState(family) for family in ("indian", "gold")
         }
         self.open_positions: dict[str, OpenExposure] = {}
+        # Account currency per family as the broker reported it at connect.
+        # Set by the runner; None until a venue has answered.
+        self.broker_currency: dict[str, str] = {}
 
     # -- session lifecycle ---------------------------------------------------
 
@@ -150,6 +153,78 @@ class RiskManager:
         return SizedPosition(
             True, contracts, risk_amount, vol_factor, binding_cap="risk",
             reason=f"{contracts} contract(s) at {loss_per_contract:,.0f} risk each",
+        )
+
+    def size_cfd(self, plan: TradePlan, leg: FuturesLeg, market: str,
+                 vol_factor: float) -> SizedPosition:
+        """Lot sizing for a spot CFD (DECISIONS D-57).
+
+        Same spirit as section 7, different grid: the loss per lot comes from
+        the broker's tick value, and volume rounds **down** to the broker's
+        ``volume_step``. Section 7.1's whole-lot floor is an index-options rule
+        and is not applied - ``0.01`` lots is a legitimate size - but a size
+        below ``volume_min`` is a rejection, never a round-up.
+
+        The tick value is in the account's currency. If that is not the
+        currency ``risk.capital`` is stated in, the division is meaningless by
+        roughly the exchange rate, so the trade is refused until
+        ``instruments.gold.account_currency`` matches what the broker reports
+        (DECISIONS D-58). No rate is assumed.
+        """
+        instrument = self.cfg.instrument_key(market)
+        base = f"instruments.{instrument}"
+        family = self.cfg.market_family(market)
+        risk_pct = self.cfg.risk_per_trade(market)
+        risk_amount = self.capital * risk_pct
+
+        declared = str(self.cfg.require(
+            f"{base}.account_currency",
+            "Declare the currency risk.capital is stated in; the broker's tick value "
+            "is in the account currency and the two must match.",
+        )).upper()
+        reported = self.broker_currency.get(family)
+        if reported is not None and reported.upper() != declared:
+            return SizedPosition(
+                False, 0, risk_amount, vol_factor,
+                reason=(f"account currency mismatch: config declares {declared} but the "
+                        f"broker reports {reported}; sizing {declared} risk against a "
+                        f"{reported} tick value is wrong by the exchange rate. Refused - "
+                        f"no conversion rate is assumed."),
+            )
+
+        volume_min = float(self.cfg.require(f"{base}.volume_min"))
+        volume_step = float(self.cfg.require(f"{base}.volume_step"))
+        volume_max = float(self.cfg.require(f"{base}.volume_max"))
+        if volume_step <= 0 or volume_min <= 0:
+            return SizedPosition(False, 0, risk_amount, vol_factor,
+                                 reason=f"{base}.volume_step/volume_min must be positive")
+
+        stop_distance = abs(plan.entry_price - plan.stop_price)
+        if stop_distance <= 0:
+            return SizedPosition(False, 0, risk_amount, vol_factor, reason="zero stop distance")
+
+        ticks = stop_distance / leg.tick_size
+        loss_per_lot = ticks * leg.tick_value
+        if loss_per_lot <= 0:
+            return SizedPosition(False, 0, risk_amount, vol_factor,
+                                 reason="non-positive loss per lot")
+
+        raw = risk_amount * vol_factor / loss_per_lot
+        volume = math.floor(raw / volume_step + 1e-9) * volume_step
+        volume = round(min(volume, volume_max), 8)
+        if volume < volume_min:
+            return SizedPosition(
+                False, 0, risk_amount, vol_factor, volume_lots=0.0,
+                reason=(f"sized to {raw:.4f} lots; the minimum is {volume_min} and one "
+                        f"minimum lot risks {loss_per_lot * volume_min:,.2f} {declared} "
+                        f"against a {risk_amount:,.2f} budget. Rounding up would breach "
+                        f"the per-trade cap."),
+            )
+
+        return SizedPosition(
+            True, 1, risk_amount, vol_factor, binding_cap="risk", volume_lots=volume,
+            reason=(f"{volume:g} lots at {loss_per_lot:,.2f} {declared}/lot "
+                    f"= {loss_per_lot * volume:,.2f} {declared} at the stop"),
         )
 
     def size_option(self, plan: TradePlan, leg: OptionLeg, market: str,
@@ -395,11 +470,15 @@ class RiskManager:
     def size(self, plan: TradePlan, market: str, vol_factor: float,
              option_leg: OptionLeg | None = None,
              futures_leg: FuturesLeg | None = None) -> SizedPosition:
-        """Dispatch to the option or futures sizing routine."""
+        """Dispatch to the option, futures or CFD sizing routine."""
         try:
             if option_leg is not None:
                 return self.size_option(plan, option_leg, market, vol_factor)
             if futures_leg is not None:
+                traded_as = str(self.cfg.get(
+                    f"instruments.{self.cfg.instrument_key(market)}.trade"))
+                if traded_as == "cfd":
+                    return self.size_cfd(plan, futures_leg, market, vol_factor)
                 return self.size_futures(plan, futures_leg, market, vol_factor)
         except ConfigBlockerError as error:
             return SizedPosition(False, 0, 0.0, vol_factor, reason=str(error))

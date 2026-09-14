@@ -324,18 +324,78 @@ class FuturesContractSelector:
         )
 
 
+class CfdSelector:
+    """G8 for a spot CFD: one symbol, no expiry, no roll (DECISIONS D-56).
+
+    The broker's own limits are enforced here rather than discovered at
+    ``order_send``: a stop closer than ``trade_stops_level`` is rejected by MT5
+    with retcode 10016, and finding that out after the entry decision is made
+    is the wrong moment. The trade is refused, never re-planned - soul file 8
+    forbids widening a stop.
+    """
+
+    def __init__(self, config: Config | None = None) -> None:
+        self.cfg = config or get_config()
+
+    def select(self, plan: TradePlan, market: str) -> LegSelection:
+        instrument = self.cfg.instrument_key(market)
+        base = f"instruments.{instrument}"
+        hint = ("Populate the gold CFD specs from the broker: run "
+                "scripts/mt5_symbol_specs.py, or connect MT5 with "
+                "prefer_broker_contract_master on.")
+        try:
+            symbol = str(self.cfg.require(f"{base}.symbol", hint))
+            multiplier = float(self.cfg.require(f"{base}.contract_multiplier", hint))
+            tick_size = float(self.cfg.require(f"{base}.tick_size", hint))
+            tick_value = float(self.cfg.require(f"{base}.tick_value", hint))
+            point = float(self.cfg.require(f"{base}.point", hint))
+            stops_level = int(self.cfg.require(f"{base}.stops_level_points", hint))
+        except ConfigBlockerError as error:
+            return LegSelection(False, str(error))
+
+        if tick_size <= 0 or tick_value <= 0 or multiplier <= 0 or point <= 0:
+            return LegSelection(
+                False, f"{base} specs must be positive (tick_size={tick_size}, "
+                       f"tick_value={tick_value}, contract_multiplier={multiplier}, point={point})"
+            )
+
+        stop_distance = abs(plan.entry_price - plan.stop_price)
+        minimum = stops_level * point
+        if stop_distance < minimum:
+            return LegSelection(
+                False,
+                f"stop {stop_distance:.{_decimals(point)}f} from entry is inside the broker's "
+                f"minimum of {minimum:.{_decimals(point)}f} ({stops_level} points); "
+                f"the broker would reject it and section 8 forbids widening it",
+            )
+
+        return LegSelection(
+            True,
+            f"CFD {symbol}, stop {stop_distance:.{_decimals(point)}f} clears the "
+            f"{minimum:.{_decimals(point)}f} floor",
+            futures_leg=FuturesLeg(
+                contract=symbol,
+                contract_multiplier=multiplier,
+                tick_size=tick_size,
+                tick_value=tick_value,
+                expiry=None,
+            ),
+        )
+
+
 class InstrumentSelector:
-    """Facade over the two selectors - the single entry point for gate G8."""
+    """Facade over the selectors - the single entry point for gate G8."""
 
     def __init__(self, config: Config | None = None) -> None:
         self.cfg = config or get_config()
         self.options = OptionLegSelector(self.cfg)
         self.futures = FuturesContractSelector(self.cfg)
+        self.cfd = CfdSelector(self.cfg)
 
     def select(self, plan: TradePlan, market: str, now: datetime,
                snapshot: ChainSnapshot | None = None,
                contracts: list[tuple[str, date]] | None = None) -> LegSelection:
-        """Route to the option or futures path based on the instrument config."""
+        """Route to the option, futures or CFD path based on the instrument config."""
         instrument = self.cfg.instrument_key(market)
         traded_as = str(self.cfg.get(f"instruments.{instrument}.trade"))
 
@@ -345,7 +405,15 @@ class InstrumentSelector:
             return self.options.select(plan, snapshot, market, now)
         if traded_as == "futures":
             return self.futures.select(contracts or [], now, market)
+        if traded_as == "cfd":
+            return self.cfd.select(plan, market)
         return LegSelection(False, f"unsupported trade mode '{traded_as}' for {market}")
+
+
+def _decimals(point: float) -> int:
+    """Display precision implied by a price point, e.g. 0.01 -> 2."""
+    text = f"{point:.10f}".rstrip("0")
+    return max(0, len(text.split(".")[1])) if "." in text else 0
 
 
 def _parse_time(text: str) -> time:

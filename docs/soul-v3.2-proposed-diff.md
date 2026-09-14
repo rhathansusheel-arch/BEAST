@@ -165,11 +165,74 @@ it rather than amending Section 13.
 
 ---
 
+## Group C — gold as a spot CFD on MetaTrader 5 (DECISIONS D-56 to D-62)
+
+The venue Beast has for XAUUSD serves it as a spot CFD in lots. v3.1 describes
+gold as a futures contract with a multiplier, tick size and tick value, and
+sizes it in whole contracts (7.1). This group proposes the amendments that make
+the document describe what the code does. Nothing in it changes a risk cap, a
+gate's order, or the Nifty/Sensex path.
+
+### C1. Section 5.7.6 — instrument selection for gold
+
+Add after the futures paragraph:
+
+> Where the gold venue is a spot CFD (`instruments.gold.trade: cfd`), there is
+> no contract list and no expiry. G8 selects the single configured symbol and
+> additionally requires the planned stop to sit at least
+> `stops_level_points × point` from the entry; a tighter stop is rejected at
+> G8, with the reason logged, and is never widened (Section 8).
+
+### C2. Section 7.1 — sizing for a CFD
+
+Add after the futures formula:
+
+> For a spot CFD the loss per lot is `(stop_distance ÷ tick_size) × tick_value`
+> with `tick_value` in the account currency. Volume is
+> `floor(risk_amount × vol_factor ÷ loss_per_lot ÷ volume_step) × volume_step`,
+> capped at `volume_max`. A result below `volume_min` is rejected. The whole-
+> lot floor of this section does not apply to a CFD; the rule it protects —
+> round down, never up — does.
+
+### C3. Section 7 — currency
+
+Add:
+
+> The currency `risk.capital` is stated in must equal the currency the venue
+> reports for the account (`instruments.gold.account_currency`). On a mismatch
+> gold is refused. No conversion rate is assumed.
+
+### C4. Appendix A — `instruments.gold`
+
+Rename nothing. Document that for `trade: cfd` the existing keys carry:
+`contract_multiplier` = ounces per lot, `tick_size` = price per tick,
+`tick_value` = account currency per tick per lot. Add: `symbol`, `point`,
+`volume_min`, `volume_step`, `volume_max`, `stops_level_points`,
+`filling_mode`, `account_currency`, `venue` (= broker company / server).
+All read from the venue at startup when `prefer_broker_contract_master` is
+true; a set value always wins; an unread value stays unset and refuses trades.
+
+### C5. Appendix A — `data.gold_spread_max`
+
+State the unit: **price units**, compared to `ask − bid`. Recommend setting it
+from the p90 of a sampled spread over the trading hours, with the hours noted.
+
+### C6. Section 10 / D-23 — the XAUUSD venue
+
+The simulated venue is no longer the XAUUSD route. In paper mode the MT5
+adapter prices fills from the venue's live tick and transmits nothing.
+
+---
+
 ## What is blocked until this is approved
 
 - Wiring `effective_size_factor` into `RiskManager.size_*` (G9).
 - Adding `G10_VOL_STATE` to the gate chain.
 - Emitting the Appendix B / C fields.
+- Group C is **implemented** behind `instruments.gold.trade: cfd` and refuses
+  every gold trade until the specs are read from a live venue and
+  `account_currency` matches — so it changes no behaviour until the operator
+  supplies a venue. Approval here is what makes the mapping canonical.
 
 `core/regime/` is complete and tested without any of the above. It computes,
 logs, and changes nothing.

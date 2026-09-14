@@ -330,13 +330,34 @@ instruments:
     prefer_broker_contract_master: true
   gold:
     analyse: xauusd
-    trade: futures
-    venue: null                   # BLOCKER 17 - COMEX_GC | MCX_GOLD | MCX_GOLDM | CFD
-    contract_multiplier: null     # BLOCKER 17
-    tick_size: null               # BLOCKER 17
-    tick_value: null              # BLOCKER 17
+    trade: cfd                    # D-56: MT5 serves XAUUSD as a spot CFD in lots, not a
+                                  #   futures contract. `futures` keeps the old path for a
+                                  #   COMEX/MCX venue.
+    # BLOCKER 17. Every null below is read from the live MT5 symbol at startup
+    # when prefer_broker_contract_master is true (scripts/mt5_symbol_specs.py
+    # prints the same block). A non-null value here always wins over the
+    # broker. An unreachable broker leaves them null and gold stays refused -
+    # nothing is guessed. The futures-named keys hold CFD fields (D-56):
+    venue: null                   #   "<company> / <server>" from account_info - which
+                                  #   broker these numbers describe; another broker's
+                                  #   XAUUSD has different specs
+    symbol: null                  #   the broker's exact symbol name (XAUUSD, XAUUSD.m, ...)
+    contract_multiplier: null     #   <- trade_contract_size: ounces per lot (usually 100)
+    tick_size: null               #   <- trade_tick_size: price units per tick
+    tick_value: null              #   <- trade_tick_value: ACCOUNT CURRENCY per tick per LOT
+    point: null                   #   <- point: price precision unit (usually 0.01)
+    volume_min: null              #   <- volume_min: smallest legal lot size
+    volume_step: null             #   <- volume_step: lot size granularity; sizing rounds DOWN to it
+    volume_max: null              #   <- volume_max
+    stops_level_points: null      #   <- trade_stops_level: minimum stop distance in points;
+                                  #      a tighter stop is rejected at G8, never widened (s.8)
+    filling_mode: null            #   <- filling_mode bitmask (FOK=1 IOC=2 BOC=4); informational
+    account_currency: null        # D-58: the currency risk.capital is stated in. Must equal
+                                  #   account_info().currency or gold is refused - tick_value
+                                  #   is in the account currency and no rate is assumed.
+    prefer_broker_contract_master: true
     lot_size: 1
-    rollover_buffer_days: 3       # CONFIRM - no entries inside the rollover window
+    rollover_buffer_days: 3       # futures only - a CFD has no expiry
 
 # ------------------------------------------------------------------------------
 # options  (soul file 4.7, 5.7, 6.10, 7.1)
@@ -399,7 +420,12 @@ data:
   sensex_delay_min: 15
   sensex_min_trigger_tf: 5M       # CONFIRM - Sensex excluded from anything tighter
   stale_feed_multiplier: 2        # last close older than N x trigger-TF interval => STALE
-  gold_spread_max: null           # BLOCKER 15 - null => high-spread rule cannot be enforced
+  gold_spread_max: null           # BLOCKER 15 - null => high-spread rule cannot be enforced.
+                                  #   UNIT: PRICE (USD per oz, e.g. 0.35), NOT points. It is
+                                  #   compared to Quote.spread = ask - bid directly in
+                                  #   core/signal_generator.py. Set it from the p90 of the
+                                  #   spread sample scripts/mt5_symbol_specs.py prints, and
+                                  #   record the hours the sample covered next to the value.
   gold_spread_max_mode: absolute  # absolute | atr_multiple
   gap_recompute_atr: 1.0          # CONFIRM
   history_bars: 1500              # bars held in memory per timeframe

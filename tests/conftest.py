@@ -33,8 +33,12 @@ def _fill_blockers(cfg: Config) -> Config:
     instruments = cfg.section("instruments")
     instruments["nifty"].update({"lot_size": 75, "strike_interval": 50})
     instruments["sensex"].update({"lot_size": 20, "strike_interval": 100})
+    # The shipped config routes gold to the MT5 CFD path (D-56). The engine
+    # tests were written against the futures path with MCX-shaped specs, so
+    # the fixture keeps that path; tests/test_gold_cfd.py covers the CFD one.
     instruments["gold"].update(
         {
+            "trade": "futures",
             "venue": "MCX_GOLDM",
             "contract_multiplier": 10.0,
             "tick_size": 1.0,

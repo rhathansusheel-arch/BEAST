@@ -422,7 +422,13 @@ class OptionLeg:
 
 @dataclass
 class FuturesLeg:
-    """The tradable futures contract produced by G8 (soul file 5.7.6)."""
+    """The tradable futures contract produced by G8 (soul file 5.7.6).
+
+    A spot CFD reuses this leg (DECISIONS D-56): ``contract`` is the broker
+    symbol, ``expiry`` is None, ``contracts`` is 1, and ``volume_lots`` carries
+    the broker volume. ``contract_multiplier`` is then ounces per lot, so a P&L
+    is ``points x contract_multiplier x volume_lots``.
+    """
 
     contract: str
     contract_multiplier: float
@@ -430,6 +436,16 @@ class FuturesLeg:
     tick_value: float
     expiry: date | None = None
     contracts: int = 0
+    volume_lots: float = 0.0
+
+    @property
+    def is_cfd(self) -> bool:
+        return self.expiry is None and self.volume_lots > 0.0
+
+    @property
+    def size_multiplier(self) -> float:
+        """What one ``quantity`` unit multiplies price points by."""
+        return self.contract_multiplier * (self.volume_lots if self.is_cfd else 1.0)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -442,11 +458,12 @@ class SizedPosition:
     """Output of G9 (soul file 7, 7.1)."""
 
     permitted: bool
-    quantity: int               # lots for options, contracts for futures
+    quantity: int               # lots for options, contracts for futures, 1 for a CFD
     risk_amount: float
     vol_factor: float
     binding_cap: str = ""
     reason: str = ""
+    volume_lots: float = 0.0    # CFD only: the broker volume behind that one unit
 
 
 @dataclass

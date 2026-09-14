@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from broker import (
     BrokerClient,
@@ -120,6 +121,16 @@ class OrderExecutor:
             side = OrderSide.BUY if signal.direction is Direction.LONG else OrderSide.SELL
             reference_price = underlying_price
 
+        metadata: dict[str, Any] = {
+            "signal_id": signal.signal_id, "leg": signal.leg_type,
+            "lots": leg.lots if signal.leg_type == "OPTION" else leg.contracts,
+            "trade_id": signal.signal_id,
+        }
+        if signal.leg_type != "OPTION" and getattr(leg, "is_cfd", False):
+            # A CFD is one position sized in broker lots; the adapter reads
+            # the exact volume from here and the stop rests server-side.
+            metadata["volume_lots"] = leg.volume_lots
+            metadata["sl"] = signal.stop_price
         request = OrderRequest(
             symbol=symbol,
             side=side,
@@ -127,8 +138,7 @@ class OrderExecutor:
             order_type=OrderType[str(self.cfg.get("broker.order_type")).upper()],
             limit_price=reference_price,
             tag=signal.signal_id[:20],
-            metadata={"signal_id": signal.signal_id, "leg": signal.leg_type,
-                      "lots": leg.lots if signal.leg_type == "OPTION" else leg.contracts},
+            metadata=metadata,
         )
         result = broker.place_order(request)
         return self._to_fill(result, request, reference_price, underlying_price, now, entering=True)

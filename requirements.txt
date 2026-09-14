@@ -20,7 +20,7 @@ ta>=0.11.0
 kiteconnect>=5.0.0          # Zerodha - Nifty/Sensex spot + option chain
 websocket-client>=1.6.0
 
-# MetaTrader 5 - XAUUSD spot data + demo execution (broker/mt5_paper_adapter.py).
+# MetaTrader 5 - XAUUSD spot data + execution (broker/mt5_adapter.py + mt5_connection.py).
 # WINDOWS ONLY: every published wheel is win_amd64 and there is no sdist, so an
 # unconditional entry would make `pip install -r requirements.txt` fail outright
 # on Linux. The marker keeps a Linux host installable.
