@@ -18,7 +18,10 @@ ExecStartPre=/home/beast-agent/venv/bin/python -m ops.preflight
 ExecStart=/home/beast-agent/venv/bin/python main.py --no-dashboard
 Restart=on-failure
 RestartPreventExitStatus=0 1 2 3
-RestartSec=10
+# A failed preflight is a control-process failure, which RestartPreventExitStatus
+# does not cover; StartLimitBurst above bounds the retries so a transient bridge
+# outage at boot is retried and a persistent block gives up and pages.
+RestartSec=30
 KillSignal=SIGTERM
 # The shutdown path writes the snapshot and the final heartbeat; give it time.
 TimeoutStopSec=90

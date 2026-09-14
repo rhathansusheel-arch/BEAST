@@ -208,7 +208,17 @@ class Watchdog:
             self.alerts.send("WATCHDOG", market, message)
 
     def _terminal_ok(self) -> bool | None:
-        """``terminal_info()`` over the bridge; None when the bridge is down."""
+        """Is the terminal process alive and the bridge able to see its module?
+
+        ``terminal_info()`` only answers inside an ``initialize()`` session,
+        and opening one would give the watchdog a broker session - the one
+        thing it must never hold. So this checks what can be checked without
+        one: the terminal process exists, and the Wine-side Python can import
+        ``MetaTrader5`` over the bridge. Whether the session works is Beast's
+        handshake's job, and its heartbeat carries ``mt5_state`` for that.
+        Returns None when the bridge itself is down.
+        """
+        alive = _process_alive("terminal64")
         try:
             import rpyc
             conn = rpyc.classic.connect(
@@ -216,12 +226,12 @@ class Watchdog:
                 int(self.cfg.get("broker.mt5.profiles.gold.port", 18812)))
             conn._config["sync_request_timeout"] = 10
             try:
-                info = conn.modules.MetaTrader5.terminal_info()
-                return info is not None
+                conn.modules.MetaTrader5.__version__
             finally:
                 conn.close()
         except Exception:
             return None
+        return alive
 
     # -- loop ----------------------------------------------------------------
 
@@ -251,15 +261,33 @@ def _systemctl(action: str, unit: str) -> bool:
 
 
 def _unit_exit_status(unit: str) -> int | None:
+    """The unit's last exit code, or None while it is running.
+
+    A failed ``ExecStartPre`` (preflight) never runs the main process, so
+    ``ExecMainStatus`` stays 0 while ``Result`` says ``exit-code``. That is a
+    startup failure, code 1 - not a clean exit - and is reported as such.
+    """
     try:
-        out = subprocess.run(["systemctl", "show", unit, "-p", "ExecMainStatus", "-p", "ActiveState"],
+        out = subprocess.run(["systemctl", "show", unit, "-p", "ExecMainStatus",
+                              "-p", "ActiveState", "-p", "Result"],
                              timeout=10, capture_output=True, text=True).stdout
         props = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
         if props.get("ActiveState") == "active":
             return None                      # still running: no exit code yet
-        return int(props.get("ExecMainStatus", "") or 0)
+        code = int(props.get("ExecMainStatus", "") or 0)
+        if code == 0 and props.get("Result") in ("exit-code", "start-limit-hit"):
+            return 1                         # control process (preflight) blocked the start
+        return code
     except Exception:
         return None
+
+
+def _process_alive(name: str) -> bool:
+    try:
+        return subprocess.run(["pgrep", "-f", name], capture_output=True,
+                              timeout=5).returncode == 0
+    except Exception:
+        return False
 
 
 def _tcp_ok(host: str, port: int) -> bool:
