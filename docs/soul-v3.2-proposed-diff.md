@@ -222,6 +222,42 @@ from the p90 of a sampled spread over the trading hours, with the hours noted.
 The simulated venue is no longer the XAUUSD route. In paper mode the MT5
 adapter prices fills from the venue's live tick and transmits nothing.
 
+## Group D — the ops layer (DECISIONS D-63 to D-71)
+
+Nothing here changes a rule. It states what the runtime does around the
+rules on an unattended host, so the document describes the process as well
+as the plan.
+
+### D1. Section 10 — startup
+
+Add:
+
+> On every start Beast asks the venue what it holds under its own tag and
+> reconciles before feeds start. A position without a resting stop receives
+> one at the plan's level immediately. A resting stop tighter than the plan
+> is kept (6.3); one wider is never moved (Section 8) and the position enters
+> SAFE mode. A position Beast cannot match to a plan enters SAFE mode: a
+> protective stop, entries paused for that market, operator paged. A venue
+> that cannot be asked is unknown, not flat.
+
+### D2. Section 8 — the kill switch
+
+Add:
+
+> The operator may halt new entries at any time; exits continue. Closing
+> positions against plan by operator command is an override under this
+> section and requires its confirmation phrase, once, at the command line;
+> each close is logged with the R the plan would have produced.
+
+### D3. Section 10 — supervision
+
+Add:
+
+> Beast writes a heartbeat every cycle. A supervisor restarts it only when
+> the heartbeat is stale and the stop was not deliberate, and never more than
+> a configured number of times per window. The supervisor takes no trading
+> action.
+
 ---
 
 ## What is blocked until this is approved

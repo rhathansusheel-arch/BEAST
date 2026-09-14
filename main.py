@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal as os_signal
 import sys
 import time
@@ -49,6 +50,8 @@ from pathlib import Path
 
 import pandas as pd
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+
 from broker import BrokerClient
 from broker.order_executor import OrderExecutor
 from broker.mt5_adapter import MT5Adapter
@@ -58,12 +61,16 @@ from broker.retry import RetryPolicy, try_call
 from broker.zerodha_client import ZerodhaClient
 from core.ai_analyst import AIAnalyst
 from core.config import Config, describe_unset, get_config
+from core.reconcile import reconcile
 from core.learning import PerformanceTracker
 from core.override import OverrideGuard
 from core.regime import StabilityTracker, VolatilityHMM
 from core.regime.hmm_engine import HMM_AVAILABLE, ModelUnusable
 from core.regime.vol_features import compute_features, session_ids
+from core.exit_manager import ExitDecision
+from core.override import OverrideAction, OverrideRequest
 from core.risk_manager import RiskManager
+from core.schemas import ExitReason, Signal
 from core.session import SessionClock
 from core.session_state import (
     build_snapshot,
@@ -76,6 +83,9 @@ from core.session_state import (
 from core.signal_generator import SignalGenerator
 from data.feature_engineering import parse_timeframe
 from data.market_data import MarketDataService
+from ops import EXIT_CLEAN, EXIT_CRASH, EXIT_DELIBERATE_HALT, EXIT_KILL, EXIT_STARTUP_FAILURE
+from ops.heartbeat import Heartbeat, read_heartbeat, write_heartbeat
+from ops.killswitch import read_flag
 from data.news_calendar import NewsCalendar
 from monitoring.alerts import AlertKind, AlertManager
 from monitoring.dashboard import Dashboard
@@ -209,6 +219,10 @@ class BeastRunner:
         self._feed_failures: dict[str, int] = {m: 0 for m in self.markets}
         self._entry_pause_reason: dict[str, str] = {}
         self._error_streak = 0
+        self._kill_mode: str | None = None
+        self._exit_code: int | None = None
+        self._last_cycle_error: str | None = None
+        self._reconcile_report = None
         self._last_review: datetime | None = None
         self._recent_signal_lines: list[str] = []
         self._recent_alert_lines: list[str] = []
@@ -608,34 +622,62 @@ class BeastRunner:
     # -- 6. positions --------------------------------------------------------
 
     def _step_sync_positions(self) -> None:
-        """Reconcile against the broker. The broker is the authority, always.
+        """Reconcile against the venue. The venue is the authority, always.
 
-        What is implemented here is the *detection* half: which markets the
-        broker says hold a position, so a disagreement with the snapshot can be
-        alerted at step 7.
-
-        What is **not** implemented here, and is the ops layer's job, is the
-        repair half - verifying that every broker position has a resting stop
-        covering its full quantity and placing one immediately if it does not,
-        restoring the target from the trade plan, rehydrating trail state under
-        the 6.3 ratchet rule, cancelling orphan orders, and forcing SAFE mode on
-        any position with no plan in the database. Until that exists, a position
-        found here is reported loudly and left alone rather than half-managed.
+        ``core/reconcile.py`` asks each connected adapter what it holds - never
+        the tracker, never the snapshot - verifies or places a stop covering
+        each position's full volume, restores the target, rehydrates trail
+        state under the 6.3 ratchet, cancels orphan orders, and puts anything
+        it cannot explain into SAFE mode. A venue that cannot be asked leaves
+        its markets with entries refused; nothing is assumed flat.
         """
-        held: list[str] = []
-        for market in self.markets:
-            broker = self.data.broker_for(market)
-            if broker is None or not broker.is_connected():
+        now = datetime.now()
+        report = reconcile(
+            self.brokers, self.positions, self.journal, self.risk, self.alerts,
+            self.cfg, now, markets=self.markets,
+        )
+        self._reconcile_report = report
+        self._broker_positions = sorted({p.market for p in report.positions})
+
+        level = self.logger.error if (report.repaired or report.disagreements
+                                      or report.unreachable or report.safe_mode) \
+            else self.logger.info
+        level("startup reconcile:")
+        for line in report.lines():
+            level("  %s", line)
+
+        # Entries stay shut on any market the venue could not be asked about,
+        # and on any market holding a position Beast cannot explain. Exits
+        # keep running either way - that is what the resting stop is for.
+        for market, reason in report.entries_to_pause.items():
+            self._entry_pause_reason[market] = reason
+
+        for market, state in report.adopted.items():
+            try:
+                signal = Signal.from_dict(state["payload"])
+            except Exception as error:
+                self.logger.error(
+                    "%s: position #%s matched plan %s but the journal payload could not "
+                    "be rebuilt (%s). Protected at the venue; entries paused.",
+                    market, state["ticket"], state["signal_id"], error,
+                )
+                self._entry_pause_reason[market] = (
+                    f"position #{state['ticket']} adopted but its plan could not be rebuilt")
                 continue
-            if self.positions.get(market) is not None:
-                held.append(market)
-        self._broker_positions = held
+            self.positions.adopt(
+                signal,
+                entry_underlying=float(state["entry_underlying"]),
+                entry_time=datetime.fromisoformat(state["entry_time"]),
+                current_stop=float(state["current_stop"]),
+                trail_activated=bool(state["trail_activated"]),
+                now=now,
+            )
 
         tracked = self.positions.open_markets()
         if tracked:
-            self.logger.info("positions carried in memory: %s", ", ".join(tracked))
+            self.logger.info("positions now managed in-process: %s", ", ".join(tracked))
         else:
-            self.logger.info("no open positions tracked at startup")
+            self.logger.info("no open positions to manage after reconcile")
 
     # -- 7. snapshot recovery ------------------------------------------------
 
@@ -735,9 +777,13 @@ class BeastRunner:
 
     def run(self, once: bool = False, wait_for_open: bool = True) -> int:
         """Run until interrupted. Returns a process exit code."""
+        if read_flag(self._kill_flag_path()) is not None:
+            self.logger.error("KILL flag is set; refusing to start. "
+                              "Clear it with `python -m ops.killswitch clear`.")
+            return EXIT_KILL
         if not self.startup(wait_for_open=wait_for_open):
             self.logger.error("startup failed; not starting the loop")
-            return 1
+            return EXIT_STARTUP_FAILURE
 
         self.running = True
         os_signal.signal(os_signal.SIGINT, self._handle_signal)
@@ -750,7 +796,7 @@ class BeastRunner:
             self.dashboard.start()
 
         interval = self._loop_interval()
-        exit_code = 0
+        exit_code = EXIT_CLEAN
         try:
             while self.running:
                 started = time.monotonic()
@@ -765,8 +811,10 @@ class BeastRunner:
                     break
                 elapsed = time.monotonic() - started
                 time.sleep(max(1.0, interval - elapsed))
+            if self._exit_code is not None:
+                exit_code = self._exit_code
         finally:
-            self.shutdown(clean=exit_code == 0)
+            self.shutdown(clean=exit_code in (EXIT_CLEAN, EXIT_KILL))
         return exit_code
 
     def _loop_interval(self) -> float:
@@ -785,8 +833,28 @@ class BeastRunner:
         return min(shortest, float(self.cfg.get("monitoring.dashboard_refresh_seconds")) * 4)
 
     def tick(self, now: datetime) -> None:
-        """One evaluation cycle across every market."""
+        """One evaluation cycle across every market.
+
+        The KILL flag is read before anything else and the heartbeat is
+        written after everything else, unconditionally - a cycle that raised
+        still leaves a heartbeat carrying the error, so the watchdog can tell
+        "alive and struggling" from "gone".
+        """
         self.stats.cycles += 1
+        self._last_cycle_error = None
+        try:
+            self._poll_kill_flag(now)
+            if not self.running:
+                return
+            self._tick_body(now)
+        except Exception as error:
+            self._last_cycle_error = f"{type(error).__name__}: {error}"
+            raise
+        finally:
+            self._write_heartbeat(now)
+            self._maybe_periodic_snapshot(now)
+
+    def _tick_body(self, now: datetime) -> None:
         dashboard_state: dict[str, dict] = {}
         risk_state: dict[str, dict] = {}
 
@@ -797,6 +865,7 @@ class BeastRunner:
                 self._tick_market(market, now, dashboard_state)
             except Exception as error:  # one bad market must not stop the others
                 self.stats.errors += 1
+                self._last_cycle_error = f"{market}: {type(error).__name__}: {error}"
                 self.logger.exception("error while evaluating %s: %s", market, error)
                 self._alert(AlertKind.ERROR, market, str(error), now)
             risk_state[market] = self.risk.headroom(market)
@@ -806,6 +875,125 @@ class BeastRunner:
         self._maybe_retrain(now)
         self._maybe_weekly_review(now)
         self._refresh_dashboard(now, dashboard_state, risk_state)
+
+    # -- ops: kill switch, heartbeat, periodic snapshot -----------------------
+
+    def _kill_flag_path(self) -> Path:
+        raw = Path(str(self.cfg.get("ops.kill_flag_path", "./KILL")))
+        return raw if raw.is_absolute() else PROJECT_ROOT / raw
+
+    def _poll_kill_flag(self, now: datetime) -> None:
+        """Honour the operator's KILL flag before any market is evaluated (D-66).
+
+        ``halt`` pauses entries and nothing else - the exit path keeps running
+        on every open position. ``flatten`` closes each position through the
+        section 8 friction step using the confirmation the flag carries, logs
+        what the plan would have produced, then stops the loop with exit code
+        3. Clearing the flag lifts a halt on the next cycle.
+        """
+        flag = read_flag(self._kill_flag_path())
+        if flag is None:
+            if self._kill_mode is not None:
+                self.logger.warning("KILL flag cleared; entries resume next cycle")
+                for market in self.markets:
+                    if self._entry_pause_reason.get(market, "").startswith("KILL"):
+                        del self._entry_pause_reason[market]
+                self._kill_mode = None
+            return
+
+        mode = str(flag.get("mode", "halt"))
+        if self._kill_mode != mode:
+            self.logger.error("KILL flag: %s set by %s at %s - %s", mode.upper(),
+                              flag.get("set_by"), flag.get("set_at"), flag.get("reason"))
+            self._alert(AlertKind.CIRCUIT_BREAKER, "SYSTEM",
+                        f"KILL {mode.upper()} by {flag.get('set_by')}: {flag.get('reason')}", now)
+            self._kill_mode = mode
+        for market in self.markets:
+            self._entry_pause_reason[market] = f"KILL {mode}: {flag.get('reason')}"
+
+        if mode == "flatten":
+            self._flatten_all(now, str(flag.get("confirmation", "")))
+            self.running = False
+            self._exit_code = EXIT_KILL
+
+    def _flatten_all(self, now: datetime, confirmation: str) -> None:
+        """Close every open position against plan, through section 8 - never around it."""
+        for market in list(self.positions.open_markets()):
+            position = self.positions.get(market)
+            if position is None:
+                continue
+            request = OverrideRequest(
+                action=OverrideAction.CLOSE_EARLY, market=market, requested_at=now,
+                confirmation_text=confirmation, note="ops.killswitch flatten",
+            )
+            verdict = self.overrides.request(request, position, self.positions.exits)
+            if not verdict.accepted:
+                self.logger.error("KILL flatten %s refused by section 8: %s", market, verdict.message)
+                continue
+            price = position.last_underlying or position.entry_underlying
+            decision = ExitDecision(True, ExitReason.OVERRIDE, exit_price=price,
+                                    detail="ops.killswitch flatten")
+            trade, alerts = self.positions.close(market, decision, now, override=verdict.record)
+            self.logger.error("KILL flatten %s closed at %s; %s", market, price, verdict.message)
+            for line in alerts:
+                self._alert(AlertKind.CIRCUIT_BREAKER, market, line, now)
+
+    def _write_heartbeat(self, now: datetime) -> None:
+        raw = Path(str(self.cfg.get("ops.heartbeat_path", "./heartbeat.json")))
+        path = raw if raw.is_absolute() else PROJECT_ROOT / raw
+        family_pnl = sum(float(s.realised_pnl) for s in self.risk.state.values())
+        open_rows = []
+        for market in self.positions.open_markets():
+            position = self.positions.get(market)
+            if position is None:
+                continue
+            leg = position.signal.futures_leg
+            open_rows.append({
+                "market": market,
+                "direction": position.direction.value,
+                "volume": leg.volume_lots if leg and leg.is_cfd else
+                          (leg.contracts if leg else (position.signal.option_leg.lots
+                                                      if position.signal.option_leg else 0)),
+                "sl_present": position.current_stop > 0,
+                "stop": position.current_stop,
+            })
+        mt5 = self.brokers.get("mt5")
+        write_heartbeat(path, Heartbeat(
+            written_at=now.isoformat(timespec="seconds"),
+            pid=os.getpid(),
+            mode=self.cfg.mode,
+            markets=list(self.markets),
+            loop_cycle_count=self.stats.cycles,
+            open_positions=open_rows,
+            feed_ok={m: self._feed_failures.get(m, 0) < FEED_FAILURES_BEFORE_PAUSE
+                     for m in self.markets},
+            entry_pause_reason=dict(self._entry_pause_reason),
+            last_error=self._last_cycle_error,
+            session_day=next((str(s.session_day) for s in self.risk.state.values()
+                              if s.session_day), None),
+            capital=float(self.risk.capital),
+            realised_pnl_today=family_pnl,
+            clean_shutdown=False,
+            mt5_state=getattr(getattr(mt5, "link", None), "state", None).value
+            if mt5 is not None and getattr(mt5, "link", None) is not None else None,
+        ))
+
+    def _maybe_periodic_snapshot(self, now: datetime) -> None:
+        """Keep ``state_snapshot.json`` current while the loop runs (D-65).
+
+        Written on the heartbeat cadence with ``in_progress=True`` so the
+        dashboard shows this session's equity and positions rather than last
+        night's, and so a later ``clean_exit=False`` still means what it says.
+        """
+        every = float(self.cfg.get("ops.snapshot_every_seconds", 30))
+        last = getattr(self, "_last_periodic_snapshot", None)
+        if last is not None and (now - last).total_seconds() < every:
+            return
+        self._last_periodic_snapshot = now
+        try:
+            self._save_snapshot(clean_exit=False, in_progress=True, quiet=True)
+        except Exception as error:
+            self.logger.warning("periodic snapshot failed: %s", error)
 
     def _tick_market(self, market: str, now: datetime, dashboard_state: dict) -> None:
         """Both clocks for one market: exits always, entries only when allowed."""
@@ -1199,7 +1387,7 @@ class BeastRunner:
                 self._error_streak,
             )
             self.running = False
-            return 1
+            return EXIT_DELIBERATE_HALT
         return 0
 
     # -- periodic work -------------------------------------------------------
@@ -1456,9 +1644,23 @@ class BeastRunner:
         self._save_snapshot(clean_exit=clean)
         self._print_session_summary(now)
         self.journal.close()
+        if clean:
+            # The watchdog reads this: an intentional stop is not to be undone.
+            try:
+                self._last_cycle_error = None
+                self._write_heartbeat(now)
+                raw = Path(str(self.cfg.get("ops.heartbeat_path", "./heartbeat.json")))
+                path = raw if raw.is_absolute() else PROJECT_ROOT / raw
+                beat = read_heartbeat(path)
+                if beat is not None:
+                    beat.clean_shutdown = True
+                    write_heartbeat(path, beat)
+            except Exception as error:
+                self.logger.warning("final heartbeat failed: %s", error)
         self.logger.info("stopped")
 
-    def _save_snapshot(self, clean_exit: bool) -> None:
+    def _save_snapshot(self, clean_exit: bool, in_progress: bool = False,
+                       quiet: bool = False) -> None:
         """Write ``state_snapshot.json``. Never raises."""
         snapshot = build_snapshot(
             risk=self.risk,
@@ -1475,10 +1677,12 @@ class BeastRunner:
             clean_exit=clean_exit,
             config=self.cfg,
         )
+        snapshot.in_progress = in_progress
         path = save_snapshot(snapshot, self.cfg)
-        self.logger.info(
-            "state snapshot written to %s (clean_exit=%s)", path, clean_exit
-        )
+        if not quiet:
+            self.logger.info(
+                "state snapshot written to %s (clean_exit=%s)", path, clean_exit
+            )
 
     def _print_session_summary(self, now: datetime) -> None:
         """The end-of-run report."""
@@ -1810,5 +2014,18 @@ def main(argv: list[str] | None = None) -> int:
     return runner.run(once=args.once, wait_for_open=not args.exit_if_closed)
 
 
+def _entry() -> int:
+    """Map an uncaught crash to the one exit code systemd is allowed to restart on."""
+    try:
+        return int(main())
+    except SystemExit as error:
+        return int(error.code or 0)
+    except KeyboardInterrupt:
+        return EXIT_CLEAN
+    except Exception:
+        logging.getLogger("beast").critical("uncaught crash:\n%s", traceback.format_exc())
+        return EXIT_CRASH
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_entry())

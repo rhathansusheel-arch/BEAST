@@ -113,6 +113,42 @@ class PositionTracker:
         )
         return position
 
+    def adopt(self, signal: Signal, entry_underlying: float, entry_time: datetime,
+              current_stop: float, trail_activated: bool, now: datetime,
+              extreme_since_entry: float | None = None) -> ManagedPosition:
+        """Take over a position the venue already holds (startup reconcile).
+
+        Nothing is sent to the venue here - its stop and target are already
+        resting, verified by the reconcile. This only rebuilds the in-process
+        view so the exit rules manage the position from here on. The stop is
+        taken as given by the caller, which has already asserted it is never
+        looser than the venue's (6.3).
+        """
+        if signal.market in self.positions:
+            logger.warning("adopt: %s already tracked; keeping the existing record", signal.market)
+            return self.positions[signal.market]
+        position = ManagedPosition(
+            signal=signal,
+            plan=_plan_from_signal(signal),
+            entry_time=entry_time,
+            entry_underlying=entry_underlying,
+            entry_premium=None,
+            current_stop=current_stop,
+            trail_activated=trail_activated,
+            extreme_since_entry=(extreme_since_entry if extreme_since_entry is not None
+                                 else entry_underlying),
+            last_underlying=entry_underlying,
+        )
+        self.positions[signal.market] = position
+        risk_amount = self.risk.capital * signal.risk_pct
+        self.risk.register_open(signal.market, signal.direction, risk_amount, entry_time)
+        logger.warning(
+            "ADOPTED %s %s from the venue: entry %.2f stop %.2f target %.2f trail_armed=%s",
+            signal.market, signal.direction.value, entry_underlying, current_stop,
+            signal.target_price, trail_activated,
+        )
+        return position
+
     # -- updating ------------------------------------------------------------
 
     def on_price(self, market: str, underlying_price: float, premium: float | None,

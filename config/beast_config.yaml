@@ -358,6 +358,8 @@ instruments:
     prefer_broker_contract_master: true
     lot_size: 1
     rollover_buffer_days: 3       # futures only - a CFD has no expiry
+    safe_mode_fallback_points: null   # D-64: SAFE-mode stop distance in POINTS when no ATR
+                                      #   can be computed. null => page CRITICAL, place nothing.
 
 # ------------------------------------------------------------------------------
 # options  (soul file 4.7, 5.7, 6.10, 7.1)
@@ -476,6 +478,25 @@ monitoring:
     telegram_enabled: false       # token and chat id come from the environment:
                                   #   BEAST_TELEGRAM_TOKEN / BEAST_TELEGRAM_CHAT_ID
     telegram_chat_id: null        # optional non-secret fallback for the chat id
+
+# ------------------------------------------------------------------------------
+# ops - reconcile, heartbeat, watchdog, kill switch, preflight (D-63 to D-70)
+# ------------------------------------------------------------------------------
+ops:
+  reconcile_match_threshold: 0.7     # CONFIRM - below this a venue position gets SAFE mode
+  safe_mode_stop_atr_multiple: 2.0   # CONFIRM - SAFE-mode stop at entry +/- N x ATR(setup TF)
+  heartbeat_path: ./heartbeat.json   # CONFIRM
+  heartbeat_stale_seconds: 90        # CONFIRM - watchdog restarts Beast past this (after one re-read)
+  snapshot_every_seconds: 30         # CONFIRM - periodic state_snapshot.json for the dashboard
+  kill_flag_path: ./KILL             # CONFIRM - written by `python -m ops.killswitch`
+  kill_default_mode: halt            # CONFIRM - halt (entries off, exits run) | flatten
+  max_restarts: 3                    # CONFIRM - watchdog crash-loop guard ...
+  restart_window_minutes: 30         # CONFIRM - ... within this window => stop restarting, page
+  watchdog_interval_seconds: 15      # CONFIRM
+  beast_unit: beast.service          # CONFIRM - what the watchdog restarts
+  dashboard_url: http://127.0.0.1:8501/_stcore/health   # CONFIRM
+  max_clock_drift_seconds: 5         # CONFIRM - preflight refuses beyond this vs MT5 server time
+  min_free_disk_mb: 2048             # CONFIRM - 4 streams x 10 MB x 30 backups ~ 1.2 GB + journal
 
 # ------------------------------------------------------------------------------
 # ai - Claude narration / review layer

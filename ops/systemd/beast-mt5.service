@@ -1,0 +1,31 @@
+# The MetaTrader 5 terminal under Wine. Owns the Wine session; the bridge joins it.
+# Install: cp ops/systemd/*.service /etc/systemd/system/ && systemctl daemon-reload
+[Unit]
+Description=Beast: MetaTrader 5 terminal under Wine
+After=xvfb.service network-online.target user-runtime-dir@0.service
+Requires=xvfb.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+# Wine 11 keeps its server socket under $XDG_RUNTIME_DIR; root must be lingering
+# (`loginctl enable-linger root`) so /run/user/0 exists from boot.
+Environment=DISPLAY=:1
+Environment=WINEARCH=win64
+Environment=WINEPREFIX=/root/.wine
+Environment=WINEDEBUG=-all
+Environment=XDG_RUNTIME_DIR=/run/user/0
+# Never prompt for Mono/Gecko headless; neither is needed.
+Environment=WINEDLLOVERRIDES=mscoree=d;mshtml=d;winemenubuilder.exe=d
+WorkingDirectory=/root
+# Unix path on purpose: systemd reads "\t" in a Windows path as a TAB.
+ExecStart=/usr/bin/wine "/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe" /portable
+ExecStopPost=-/usr/bin/wineserver -k
+Restart=always
+RestartSec=10
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

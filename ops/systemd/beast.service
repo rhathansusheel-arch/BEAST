@@ -1,0 +1,27 @@
+# Beast itself. Preflight gates the start; exit codes decide the restart.
+#   0 clean  1 startup failure  2 deliberate halt  3 KILL flag  >=10 crash
+# Only a crash is restarted (RestartPreventExitStatus). The watchdog covers
+# the case systemd cannot see: a process that is alive but not looping.
+[Unit]
+Description=Beast trading agent
+After=beast-rpyc.service network-online.target
+Wants=beast-rpyc.service network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+WorkingDirectory=/home/beast-agent
+# Do NOT use EnvironmentFile= for .env: systemd strips backslashes from
+# values like C:\Program Files\... . core.config loads .env itself.
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/home/beast-agent/venv/bin/python -m ops.preflight
+ExecStart=/home/beast-agent/venv/bin/python main.py --no-dashboard
+Restart=on-failure
+RestartPreventExitStatus=0 1 2 3
+RestartSec=10
+KillSignal=SIGTERM
+# The shutdown path writes the snapshot and the final heartbeat; give it time.
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

@@ -54,6 +54,8 @@ import pandas as pd
 
 from broker import (
     BrokerClient,
+    BrokerOrder,
+    BrokerPosition,
     OrderRequest,
     OrderResult,
     OrderSide,
@@ -563,6 +565,139 @@ class MT5Adapter(BrokerClient):
         return OrderResult(False, paper=False,
                            message=f"close retcode {retcode} "
                                    f"({RETCODE_TEXT.get(retcode, 'unknown')})")
+
+    # -- reconcile surface ---------------------------------------------------
+
+    def open_positions(self) -> list[BrokerPosition] | None:
+        """Every position carrying Beast's magic number, straight from the venue.
+
+        On MT5 the stop loss and take profit are fields of the position record
+        (``position.sl`` / ``position.tp``), not separate pending orders, and a
+        position's SL always applies to its whole volume - a partial close
+        produces a new ticket that inherits it. So ``stop_volume`` is left
+        ``None`` here: "is a stop resting" is exactly ``sl != 0``.
+        """
+        if not self.is_connected():
+            return None
+        try:
+            rows = self.link.call("positions_get", allow_none=True) or ()
+        except BridgeError as error:
+            logger.error("MT5 positions_get failed: %s", error)
+            return None
+
+        magic = self._magic()
+        found: list[BrokerPosition] = []
+        for row in rows:
+            if int(getattr(row, "magic", -1)) != magic:
+                continue
+            symbol = str(getattr(row, "symbol", ""))
+            is_buy = int(getattr(row, "type", 0)) == int(self.link._client.ORDER_TYPE_BUY)
+            found.append(BrokerPosition(
+                market=self._market_for(symbol),
+                symbol=symbol,
+                ticket=int(getattr(row, "ticket", 0)),
+                side=OrderSide.BUY if is_buy else OrderSide.SELL,
+                volume=float(getattr(row, "volume", 0.0) or 0.0),
+                entry_price=float(getattr(row, "price_open", 0.0) or 0.0),
+                sl=float(getattr(row, "sl", 0.0) or 0.0),
+                tp=float(getattr(row, "tp", 0.0) or 0.0),
+                opened_at=self.server_time(getattr(row, "time", 0)) if getattr(row, "time", 0) else None,
+                comment=str(getattr(row, "comment", "")),
+                magic=magic,
+            ))
+        return found
+
+    def pending_orders(self) -> list[BrokerOrder] | None:
+        if not self.is_connected():
+            return None
+        try:
+            rows = self.link.call("orders_get", allow_none=True) or ()
+        except BridgeError as error:
+            logger.error("MT5 orders_get failed: %s", error)
+            return None
+        magic = self._magic()
+        client = self.link._client
+        found: list[BrokerOrder] = []
+        for row in rows:
+            if int(getattr(row, "magic", -1)) != magic:
+                continue
+            symbol = str(getattr(row, "symbol", ""))
+            kind = int(getattr(row, "type", 0))
+            is_buy = kind in (int(getattr(client, "ORDER_TYPE_BUY", 0)),
+                              int(getattr(client, "ORDER_TYPE_BUY_LIMIT", 2)),
+                              int(getattr(client, "ORDER_TYPE_BUY_STOP", 4)))
+            found.append(BrokerOrder(
+                market=self._market_for(symbol), symbol=symbol,
+                ticket=int(getattr(row, "ticket", 0)),
+                side=OrderSide.BUY if is_buy else OrderSide.SELL,
+                volume=float(getattr(row, "volume_current", 0.0) or 0.0),
+                price=float(getattr(row, "price_open", 0.0) or 0.0),
+                comment=str(getattr(row, "comment", "")), magic=magic,
+                position_ticket=int(getattr(row, "position_id", 0) or 0),
+            ))
+        return found
+
+    def set_position_stop(self, ticket: int, sl: float, tp: float | None = None) -> OrderResult:
+        """Set a position's SL (and optionally TP) with re-query and verify.
+
+        ``TRADE_ACTION_SLTP`` is idempotent - setting the value already on the
+        position is a no-op at the venue - so this re-reads first and sends
+        only when something would change, then re-reads again to confirm.
+        A stop that was "sent" is not a stop that is resting; the caller gets
+        the confirmed value, not the intent.
+        """
+        current = self._position_by_ticket(ticket)
+        if current is None:
+            return OrderResult(False, paper=False, message=f"position {ticket} is not open")
+
+        spec = self.link.spec(current.market) or self.link.spec(current.symbol)
+        digits = spec.digits if spec else 2
+        want_sl = round(float(sl), digits)
+        want_tp = round(float(tp), digits) if tp is not None else current.tp
+        if round(current.sl, digits) == want_sl and round(current.tp, digits) == want_tp:
+            return OrderResult(True, str(ticket), paper=False,
+                               message=f"already resting: sl={want_sl} tp={want_tp}")
+
+        client = self.link._client
+        payload = {
+            "action": client.TRADE_ACTION_SLTP,
+            "symbol": current.symbol,
+            "position": int(ticket),
+            "sl": want_sl,
+            "tp": want_tp,
+            "magic": self._magic(),
+        }
+        try:
+            result = self.link.call("order_send", payload)
+        except BridgeError as error:
+            return OrderResult(False, paper=False, message=f"SLTP failed: {error}")
+        retcode = int(getattr(result, "retcode", -1))
+        if retcode not in (RETCODE_DONE, RETCODE_DONE_PARTIAL):
+            return OrderResult(False, paper=False,
+                               message=f"SLTP retcode {retcode} "
+                                       f"({RETCODE_TEXT.get(retcode, 'unknown')}): "
+                                       f"{getattr(result, 'comment', '')}")
+
+        after = self._position_by_ticket(ticket)
+        if after is None or round(after.sl, digits) != want_sl:
+            return OrderResult(
+                False, paper=False,
+                message=f"SLTP acknowledged but re-read shows sl="
+                        f"{getattr(after, 'sl', None)} not {want_sl}",
+            )
+        return OrderResult(True, str(ticket), paper=False,
+                           message=f"confirmed resting: sl={after.sl} tp={after.tp}")
+
+    def _position_by_ticket(self, ticket: int) -> BrokerPosition | None:
+        rows = self.open_positions() or []
+        return next((row for row in rows if row.ticket == int(ticket)), None)
+
+    def _market_for(self, symbol: str) -> str:
+        """Beast's market name for a broker symbol, from the resolved specs."""
+        for market, spec in self.link.facts.specs.items():
+            if spec.name == symbol:
+                return market
+        return symbol.upper()
 
     def cancel_order(self, order_id: str) -> bool:
         """Remove a working order by ticket. A filled deal cannot be cancelled."""

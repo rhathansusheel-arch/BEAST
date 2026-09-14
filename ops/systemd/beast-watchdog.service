@@ -1,0 +1,15 @@
+# The watchdog. Restarts processes and raises alerts; holds no broker handle.
+[Unit]
+Description=Beast: watchdog (heartbeat, terminal, bridge, dashboard)
+After=beast.service
+Wants=beast.service
+
+[Service]
+WorkingDirectory=/home/beast-agent
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/beast-agent/venv/bin/python -m ops.watchdog
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

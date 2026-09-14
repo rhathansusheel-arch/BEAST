@@ -1,0 +1,28 @@
+# The RPyC classic server in the Wine-side Python. LOOPBACK ONLY.
+# RPyC classic mode is remote code execution for anyone who reaches the port:
+# --host 127.0.0.1 is the security boundary and ufw denies 18812 as well.
+[Unit]
+Description=Beast: RPyC bridge to the Wine-hosted MetaTrader5 module (127.0.0.1 only)
+After=beast-mt5.service user-runtime-dir@0.service
+Requires=beast-mt5.service
+PartOf=beast-mt5.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Environment=DISPLAY=:1
+Environment=WINEARCH=win64
+Environment=WINEPREFIX=/root/.wine
+Environment=WINEDEBUG=-all
+Environment=XDG_RUNTIME_DIR=/run/user/0
+Environment=WINEDLLOVERRIDES=mscoree=d;mshtml=d;winemenubuilder.exe=d
+WorkingDirectory=/root
+ExecStartPre=/bin/sleep 20
+ExecStart=/usr/bin/wine /root/.wine/drive_c/Python311/python.exe /root/.wine/drive_c/mt5libs/mt5server.py --host 127.0.0.1 -p 18812
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

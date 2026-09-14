@@ -150,24 +150,38 @@ def header(cfg, snapshot) -> None:
     )
     pct = day_pnl / snapshot.capital if snapshot.capital else 0.0
     columns[2].metric("Day P&L", f"Rs {day_pnl:+,.0f}", f"{pct:+.2%}")
+    live = bool(getattr(snapshot, "in_progress", False))
+    if live:
+        label, colour = "LIVE", "normal"
+    elif snapshot.clean_exit:
+        label, colour = "clean exit", "normal"
+    else:
+        label, colour = "UNCLEAN EXIT", "inverse"
     columns[3].metric(
         "Snapshot age",
         "unknown" if age is None else _humanise(age),
-        delta="clean exit" if snapshot.clean_exit else "UNCLEAN EXIT",
-        delta_color="normal" if snapshot.clean_exit else "inverse",
+        delta=label,
+        delta_color=colour,
     )
 
-    if not snapshot.clean_exit:
+    if live:
+        stale_after = timedelta(minutes=2)
+        if age is not None and age > stale_after:
+            st.error(
+                f"Beast was running when this was written but it is now "
+                f"{_humanise(age)} old - the loop has stopped writing. Check "
+                f"`heartbeat.json`, the watchdog, and the resting stops."
+            )
+    elif not snapshot.clean_exit:
         st.error(
             "The run that wrote this snapshot did **not** shut down cleanly. "
             "Verify open positions and their resting stops at the broker before "
             "trusting anything below."
         )
-    if age is not None and age > timedelta(minutes=10):
+    elif age is not None and age > timedelta(minutes=10):
         st.info(
-            f"This snapshot is {_humanise(age)} old. It is written at shutdown "
-            f"and on the error path, so a long gap means Beast is running "
-            f"normally and has not written since it started."
+            f"This snapshot is {_humanise(age)} old and Beast is not running "
+            f"(clean exit). Start it to see live state."
         )
 
 

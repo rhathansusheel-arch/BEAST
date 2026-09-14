@@ -300,4 +300,4 @@ def test_golden_path_from_fixture_to_order(cfg):
     assert request.quantity == 1
     assert request.metadata["volume_lots"] == pytest.approx(0.40)
     assert request.metadata["sl"] == 2495.00
-    assert request.metadata["trade_id"] == "sig-golden"
+    assert request.metadata["trade_id"] == "beast:XAUUSD:20260914:siggolde"

@@ -103,6 +103,55 @@ class OrderResult:
     message: str = ""
 
 
+@dataclass
+class BrokerPosition:
+    """A position as the venue reports it - the reconcile's input.
+
+    ``sl``/``tp`` are 0.0 when absent. On MT5 they are attributes of the
+    position record itself and always cover its full volume; there is no
+    separate stop order to size-check. A venue that models stops as resting
+    orders would fill ``stop_volume`` from that order instead.
+    """
+
+    market: str
+    symbol: str
+    ticket: int
+    side: OrderSide
+    volume: float
+    entry_price: float
+    sl: float = 0.0
+    tp: float = 0.0
+    stop_volume: float | None = None     # None => the stop is on the position (MT5)
+    opened_at: datetime | None = None
+    comment: str = ""
+    magic: int = 0
+
+    @property
+    def stop_present(self) -> bool:
+        return self.sl > 0.0
+
+    @property
+    def stop_covers_volume(self) -> bool:
+        if not self.stop_present:
+            return False
+        return self.stop_volume is None or self.stop_volume >= self.volume
+
+
+@dataclass
+class BrokerOrder:
+    """A pending (working) order as the venue reports it."""
+
+    market: str
+    symbol: str
+    ticket: int
+    side: OrderSide
+    volume: float
+    price: float
+    comment: str = ""
+    magic: int = 0
+    position_ticket: int = 0             # 0 when not attached to a position
+
+
 class BrokerClient(ABC):
     """The interface every adapter implements."""
 
@@ -147,3 +196,22 @@ class BrokerClient(ABC):
     def capital(self) -> float | None:
         """Account equity, for live sizing. ``None`` when unavailable."""
         return None
+
+    # -- reconcile surface (core/reconcile.py) --------------------------------
+
+    def open_positions(self) -> list[BrokerPosition] | None:
+        """Positions the venue holds under Beast's tag.
+
+        Returns ``None`` when the venue cannot be asked - which the reconcile
+        treats as "unknown, refuse entries", never as "flat". A simulated venue
+        returns ``[]``: it holds nothing across a restart.
+        """
+        return []
+
+    def pending_orders(self) -> list[BrokerOrder] | None:
+        """Working orders under Beast's tag, or ``None`` when unknown."""
+        return []
+
+    def set_position_stop(self, ticket: int, sl: float, tp: float | None = None) -> OrderResult:
+        """Set a position's protective stop (and target) at the venue."""
+        return OrderResult(False, message=f"{self.name} cannot modify a position's stop")

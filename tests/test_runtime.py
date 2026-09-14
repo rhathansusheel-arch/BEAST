@@ -413,11 +413,12 @@ class TestErrorHandling:
 
     def test_a_repeating_error_halts_with_a_non_zero_code(self, runner):
         from main import ERROR_STREAK_BEFORE_HALT
+        from ops import EXIT_DELIBERATE_HALT
 
         code = 0
         for _ in range(ERROR_STREAK_BEFORE_HALT):
             code = runner._handle_unhandled(RuntimeError("stuck"))
-        assert code == 1
+        assert code == EXIT_DELIBERATE_HALT, "a deliberate halt must not look like a crash"
         assert runner.running is False
 
     def test_an_error_writes_an_unclean_snapshot(self, runner, cfg, tmp_path):

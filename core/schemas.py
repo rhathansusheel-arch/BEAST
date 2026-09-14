@@ -571,6 +571,80 @@ class Signal:
             "reason_line": self.reason_line,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Signal":
+        """Rebuild a signal from its Appendix B JSON.
+
+        The inverse of :meth:`to_dict`, used by the startup reconcile to adopt
+        a position whose plan lives only in the journal. Tolerant of unknown
+        keys and of a missing chain context; strict about the fields the exit
+        rules need, because a half-rebuilt plan is worse than none.
+        """
+        leg = dict(data.get("leg") or {})
+        option_leg = None
+        if leg.get("_option_only"):
+            raw = dict(leg["_option_only"])
+            raw["expiry"] = date.fromisoformat(str(raw["expiry"]))
+            option_leg = OptionLeg(**{k: v for k, v in raw.items()
+                                      if k in OptionLeg.__dataclass_fields__})
+        futures_leg = None
+        if leg.get("_futures_only"):
+            raw = dict(leg["_futures_only"])
+            raw["expiry"] = date.fromisoformat(str(raw["expiry"])) if raw.get("expiry") else None
+            futures_leg = FuturesLeg(**{k: v for k, v in raw.items()
+                                        if k in FuturesLeg.__dataclass_fields__})
+        chain = None
+        if data.get("chain_context"):
+            raw = dict(data["chain_context"])
+            if "oi_tag" in raw:
+                raw["oi_tag"] = OITag(raw["oi_tag"])
+            chain = ChainContext(**{k: v for k, v in raw.items()
+                                    if k in ChainContext.__dataclass_fields__})
+        trail_raw = dict(data.get("trail") or {})
+        return cls(
+            market=str(data["market"]),
+            underlying=str(data.get("underlying", data["market"])),
+            direction=Direction(str(data["direction"])),
+            setup_type=SetupType(int(data["setup_type"])),
+            setup_ref=str(data.get("setup_ref", "")),
+            regime=Regime(str(data.get("regime", Regime.RANGE.value))),
+            counter_bias=bool(data.get("counter_bias", False)),
+            confluence_mode=ConfluenceMode(str(data.get(
+                "confluence_mode", ConfluenceMode.TREND_CONTINUATION.value))),
+            confluence_count=dict(data.get("confluence_count") or {}),
+            indicator_reads=dict(data.get("indicator_reads") or {}),
+            timeframes=dict(data.get("timeframes") or {}),
+            entry_price=float(data["entry_price"]),
+            stop_price=float(data["stop_price"]),
+            stop_source=str(data.get("stop_source", "")),
+            target_price=float(data["target_price"]),
+            target_r=float(data.get("target_r", 2.0)),
+            trail=TrailPlan(**{k: v for k, v in trail_raw.items()
+                               if k in TrailPlan.__dataclass_fields__}),
+            risk_pct=float(data.get("risk_pct", 0.0)),
+            vol_factor=float(data.get("vol_factor", 1.0)),
+            atr_setup_tf=float(data.get("atr_setup_tf", 0.0)),
+            timestamp_ist=datetime.fromisoformat(str(data["timestamp_ist"])),
+            leg_type=str(leg.get("type", data.get("leg_type", "FUTURES"))),
+            option_leg=option_leg,
+            futures_leg=futures_leg,
+            chain_context=chain,
+            hmm_context=dict(data.get("hmm_context") or {}),
+            flags=[Flag(f) for f in data.get("flags") or [] if f in Flag._value2member_map_],
+            mode=str(data.get("mode", "paper")),
+            reason_line=str(data.get("reason_line", "")),
+            signal_id=str(data.get("signal_id") or uuid.uuid4()),
+        )
+
+    def plan(self) -> TradePlan:
+        """The exit plan this signal was emitted with."""
+        return TradePlan(
+            direction=self.direction, entry_price=self.entry_price,
+            stop_price=self.stop_price, target_price=self.target_price,
+            stop_source=self.stop_source, target_r=self.target_r, trail=self.trail,
+            atr=self.atr_setup_tf, risk_points=abs(self.entry_price - self.stop_price),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Appendix C - Trade log and rejection log

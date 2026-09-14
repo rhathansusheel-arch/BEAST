@@ -32,6 +32,26 @@ from broker import (
     OrderType,
 )
 from core.config import Config, get_config
+
+
+def client_tag(market: str, when: datetime, signal_id: str) -> str:
+    """``beast:<market>:<session_day>:<plan_id>`` - the order's identity at the venue.
+
+    Deterministic from the signal, so a resend after a timeout carries the same
+    tag and the reconcile can match a position back to its plan by comment
+    alone. ``plan_id`` is the first eight hex characters of the signal id; the
+    whole tag is at most 31 characters for a six-letter market, which is what
+    MT5 preserves.
+    """
+    return f"beast:{market.upper()}:{when:%Y%m%d}:{signal_id.replace('-', '')[:8]}"
+
+
+def parse_client_tag(comment: str) -> tuple[str, str, str] | None:
+    """``(market, session_day, plan_id)`` from a tag, or None when it is not ours."""
+    parts = str(comment).strip().split(":")
+    if len(parts) != 4 or parts[0] != "beast":
+        return None
+    return parts[1], parts[2], parts[3]
 from core.schemas import Direction, ExitReason, Signal
 
 logger = logging.getLogger("beast.executor")
@@ -124,7 +144,9 @@ class OrderExecutor:
         metadata: dict[str, Any] = {
             "signal_id": signal.signal_id, "leg": signal.leg_type,
             "lots": leg.lots if signal.leg_type == "OPTION" else leg.contracts,
-            "trade_id": signal.signal_id,
+            # The reconcile key: deterministic, and short enough to survive a
+            # 31-character broker comment field intact.
+            "trade_id": client_tag(signal.market, now, signal.signal_id),
         }
         if signal.leg_type != "OPTION" and getattr(leg, "is_cfd", False):
             # A CFD is one position sized in broker lots; the adapter reads

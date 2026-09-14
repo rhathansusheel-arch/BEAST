@@ -1,0 +1,14 @@
+# Read-only Streamlit view, bound to loopback. Reach it over an SSH tunnel
+# (ssh -L 8501:127.0.0.1:8501 root@host) or the nginx basic-auth proxy on :80.
+[Unit]
+Description=Beast: read-only Streamlit dashboard (127.0.0.1 only)
+After=network.target
+
+[Service]
+WorkingDirectory=/home/beast-agent
+ExecStart=/home/beast-agent/venv/bin/python -m streamlit run monitoring/streamlit_app.py --server.headless true --server.address 127.0.0.1 --server.port 8501 --browser.gatherUsageStats false
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

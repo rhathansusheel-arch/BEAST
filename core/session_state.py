@@ -102,6 +102,7 @@ class SessionSnapshot:
     version: int = SNAPSHOT_VERSION
     written_at: str = ""
     clean_exit: bool = False
+    in_progress: bool = False    # written mid-session on the heartbeat cadence (D-65)
     mode: str = "paper"
     capital: float = 0.0
     counters: dict[str, dict[str, Any]] = field(default_factory=dict)
