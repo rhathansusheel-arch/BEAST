@@ -107,10 +107,14 @@ refuses to restart through one.
 `python -m ops.preflight` - also `ExecStartPre` for `beast.service`, so a
 failing box does not start. Eight rows, any FAIL blocks:
 
-1. no config blockers for the markets in `broker.symbols`
-2. `MT5_GOLD_*` present; `BEAST_ALLOW_LIVE` not set unless `account_mode: live`
-3. bridge reachable, terminal and account answer, account is DEMO when `mode: paper`
-4. the gold symbol resolves and selects
+1. `MT5_GOLD_*` present; `BEAST_ALLOW_LIVE` not set unless `account_mode: live`
+2. bridge reachable, terminal and account answer, account is DEMO when `mode: paper`
+3. the gold symbol resolves and selects
+4. no config blockers for the markets in `broker.symbols` - run after the
+   symbol check on purpose (D-81): the gold keys the venue will fill at
+   startup are excused once the symbol resolved and the venue reports a
+   usable value; `instruments.gold.account_currency` never is, because it is
+   the operator's declaration, not a venue fact (D-58)
 5. NTP synchronised (`timedatectl`) and local time within
    `ops.max_clock_drift_seconds` of the venue's tick clock
 6. free disk >= `ops.min_free_disk_mb` under the log directory
@@ -141,6 +145,51 @@ under Beast's magic number - never the tracker, never the snapshot - and:
 The whole report is logged at ERROR when anything was repaired or disagreed.
 `python -m ops.watchdog --once` and `journalctl -u beast -n 60` are the two
 commands to read after any restart.
+
+## When the bridge drops mid-session (D-80)
+
+Beast does not wait for a restart. `MT5Adapter.maintain()` runs every cycle:
+
+- first attempt `broker.mt5.retry.reconnect_base_seconds` (5 s) after the
+  drop, doubling to `reconnect_max_seconds` (300 s); a login the venue
+  rejected (`-6`) waits the ceiling from the start - a dead password does not
+  come back by being asked every five seconds;
+- one handshake per attempt, bounded by `timeouts.connect_seconds`, so the
+  exit path is never blocked by a retry window;
+- `API_LOST` pages once on the drop and again every
+  `ops.api_lost_reminder_minutes` while still down; the return is
+  `API_RESTORED`;
+- on return: gold specs re-validated against the cache (`SPEC_DRIFT` if they
+  moved - not applied, entries paused), routed markets with no in-process
+  position reconciled against the venue, the startup entry pause lifted, the
+  blocker board refreshed.
+
+`heartbeat.json` carries `system.ready` and `system.readiness_issues`; the
+dashboard's System panel shows **ready to trade** or the list. "Running" and
+"ready" are different claims.
+
+## Gold contract specs: cache and drift (D-81)
+
+`ops.gold_specs_cache_path` (`logs/gold_specs_cache.json`) holds the last
+specs the venue confirmed, keyed by login and server. They are re-read at
+startup, on every reconnect and every `ops.gold_specs_revalidate_hours`. A
+value that changed is `SPEC_DRIFT`: logged with old and new, **never
+applied**, entries paused. To accept a genuine change: confirm it in the
+terminal's symbol specification, `rm logs/gold_specs_cache.json`, restart.
+A connected venue with no usable gold symbol is `SYMBOL_UNRESOLVED` - fix
+`broker.mt5.profiles.gold.symbols.XAUUSD` or the account's symbol list; the
+bridge is fine.
+
+## The spread ceiling and unreviewed thresholds (D-82)
+
+`data.gold_spread_max: null` with `data.gold_spread_auto_calibrate: true`
+means: after connecting, sample the live spread for
+`gold_spread_calibration_seconds` while the gold session is open, take the
+p90, multiply by `gold_spread_safety_multiplier`, use that for the session and
+log every input. It is listed in the boot banner and the
+`THRESHOLDS_UNREVIEWED` alert until a number is written into the config, which
+always wins. `mode: live` is refused while any listed threshold gates an active
+market - so are keys named under `risk.unreviewed_thresholds`.
 
 ## The dashboard: live, and reachable without opening a port
 

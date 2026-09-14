@@ -56,22 +56,51 @@ class Preflight:
         self.disk_free_mb = disk_free_mb or _disk_free_mb
         self.environ = os.environ if environ is None else environ
         self._connected = False
+        self._spec = None
 
     # -- the eight ---------------------------------------------------------
 
     def check_blockers(self) -> Check:
+        """Unset keys that gate an active market and that nothing will fill.
+
+        Runs after :meth:`check_symbol` on purpose. The gold contract specs are
+        ``null`` in the shipped config *by design* - startup reads them from
+        the venue (D-56) - so a preflight that failed on them would refuse
+        every correctly configured start. They are excused only when the
+        symbol actually resolved and the venue reports a usable value; a
+        ``0`` from the venue is left on the list, because startup leaves it
+        unset too. ``data.gold_spread_max`` is excused while auto-calibration
+        is on (D-82). ``account_currency`` is never excused: it is the
+        operator's declaration, not a venue fact (D-58).
+        """
         markets = [str(m).upper() for m in self.cfg.get("broker.symbols")]
-        families = {self.cfg.market_family(m) for m in markets}
-        relevant = [
-            key for key in self.cfg.unset_blockers()
-            if (key.startswith("instruments.gold") and "gold" in families)
-            or (key.startswith("instruments.nifty") and "indian" in families and "NIFTY50" in markets)
-            or (key.startswith("instruments.sensex") and "SENSEX" in markets)
-            or (key.startswith("options.") and "indian" in families)
-            or (key == "data.gold_spread_max" and "gold" in families)
-        ]
-        return Check("config blockers for active markets", not relevant,
-                     "none" if not relevant else ", ".join(relevant))
+        unset = self.cfg.unset_blockers(markets)
+        fillable = self._discovery_fills()
+        remaining = [key for key in unset if key not in fillable]
+        excused = [key for key in unset if key in fillable]
+        detail = "none" if not remaining else ", ".join(remaining)
+        if excused:
+            detail += f" (filled at startup by MT5 discovery: {', '.join(excused)})"
+        return Check("config blockers for active markets", not remaining, detail)
+
+    def _discovery_fills(self) -> set[str]:
+        """Blocker keys startup discovery will populate, given what preflight saw."""
+        out: set[str] = set()
+        if bool(self.cfg.get("data.gold_spread_auto_calibrate", False)):
+            out.add("data.gold_spread_max")
+        spec = getattr(self, "_spec", None)
+        gold = self.cfg.get("instruments.gold", {}) or {}
+        if spec is None or str(gold.get("trade")) != "cfd" \
+                or not gold.get("prefer_broker_contract_master", True):
+            return out
+        from broker.mt5_connection import GOLD_SPEC_FIELDS
+        for key, attr in GOLD_SPEC_FIELDS.items():
+            if getattr(spec, attr, None) not in (None, "", 0, 0.0):
+                out.add(f"instruments.gold.{key}")
+        if getattr(getattr(self._mt5, "facts", None), "company", "") \
+                or getattr(getattr(self._mt5, "facts", None), "server", ""):
+            out.add("instruments.gold.venue")
+        return out
 
     def check_env(self) -> Check:
         prefix = str(self.cfg.get("broker.mt5.profiles.gold.env_prefix", "MT5_GOLD"))
@@ -115,6 +144,7 @@ class Preflight:
             return Check("gold symbol selectable", False, str(error))
         if spec is None:
             return Check("gold symbol selectable", False, "no XAUUSD symbol resolved")
+        self._spec = spec
         return Check("gold symbol selectable", True, spec.name)
 
     def check_clock(self) -> Check:
@@ -198,10 +228,10 @@ class Preflight:
 
     def run(self) -> list[Check]:
         checks = [
-            self.check_blockers(),
             self.check_env(),
             self.check_bridge(),
             self.check_symbol(),
+            self.check_blockers(),      # after the symbol: discovery may excuse gold keys
             self.check_clock(),
             self.check_host_timezone(),
             self.check_disk(),

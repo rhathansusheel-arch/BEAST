@@ -77,6 +77,10 @@ class AlertKind(str, Enum):
     LARGE_PNL = "LARGE_PNL"
     FEED_DOWN = "FEED_DOWN"
     API_LOST = "API_LOST"
+    API_RESTORED = "API_RESTORED"          # D-80: the recovery is its own event, not a flavour of loss
+    SYMBOL_UNRESOLVED = "SYMBOL_UNRESOLVED"  # D-81: connected, but the venue has no usable symbol
+    SPEC_DRIFT = "SPEC_DRIFT"              # D-81: a cached contract spec changed at the venue
+    THRESHOLDS_UNREVIEWED = "THRESHOLDS_UNREVIEWED"  # D-82: risk floors still placeholder/auto
     MODEL_RETRAINED = "MODEL_RETRAINED"
     FLICKER_EXCEEDED = "FLICKER_EXCEEDED"
 
@@ -95,6 +99,7 @@ class AlertKind(str, Enum):
             AlertKind.CIRCUIT_BREAKER,
             AlertKind.FEED_DOWN,
             AlertKind.API_LOST,
+            AlertKind.SPEC_DRIFT,
         )
 
 
@@ -306,12 +311,46 @@ class AlertManager:
         )
 
     def api_restored(self, broker: str, latency_ms: float | None = None) -> None:
-        """A broker session came back."""
+        """A broker session came back - its own kind, so the feed reads as a recovery."""
         tail = f" ({latency_ms:.0f}ms)" if latency_ms is not None else ""
         self.send(
-            AlertKind.API_LOST, broker.upper(),
+            AlertKind.API_RESTORED, broker.upper(),
             f"broker session restored{tail}.",
             payload={"broker": broker, "restored": True},
+        )
+
+    def symbol_unresolved(self, market: str, detail: str) -> None:
+        """Connected to the venue, but it has no usable symbol for ``market``.
+
+        Kept apart from ``API_LOST`` because the cause and the fix differ: the
+        bridge is fine; the config's symbol name or the account's symbol
+        list is what needs attention.
+        """
+        self.send(
+            AlertKind.SYMBOL_UNRESOLVED, market,
+            f"{detail}. Trades refused until instruments.{market.lower()}.symbol names a "
+            f"symbol this account can trade (scripts/mt5_symbol_specs.py lists them).",
+            payload={"market": market, "detail": detail},
+        )
+
+    def spec_drift(self, market: str, changes: dict) -> None:
+        """A contract spec the venue reported differs from the one cached last session."""
+        lines = "; ".join(f"{k}: {old} -> {new}" for k, (old, new) in changes.items())
+        self.send(
+            AlertKind.SPEC_DRIFT, market,
+            f"the venue changed the contract specs since they were cached: {lines}. NOT "
+            f"applied - sizing would silently change. Confirm at the venue, then restart.",
+            payload={"market": market, "changes": {k: list(v) for k, v in changes.items()}},
+        )
+
+    def thresholds_unreviewed(self, items: dict[str, str]) -> None:
+        """Risk floors that are still placeholders or auto-calibrated, not operator-set."""
+        lines = "; ".join(f"{key} = {how}" for key, how in items.items())
+        self.send(
+            AlertKind.THRESHOLDS_UNREVIEWED, "CONFIG",
+            f"risk thresholds not yet reviewed by the operator: {lines}. Paper trading "
+            f"proceeds; these must be set explicitly before anything goes near live capital.",
+            payload={"items": items},
         )
 
     def model_retrained(self, market: str, model_version: str, n_states: int,

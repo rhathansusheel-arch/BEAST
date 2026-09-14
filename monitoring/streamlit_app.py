@@ -420,6 +420,17 @@ def system_panel(state: dict, active: bool) -> None:
     st.caption("brokers: " + " · ".join(
         f"{b.get('name')} {'connected' if b.get('connected') else 'DOWN'}"
         f"{' (' + str(b.get('state')) + ')' if b.get('state') else ''}" for b in brokers) or "none")
+    # "Running" and "ready" are different claims (D-80): a live process with
+    # the bridge down or a spec unset is not trading, and must not look like it is.
+    if "ready" in system:
+        if system.get("ready"):
+            st.success("ready to trade")
+        else:
+            st.error("NOT READY TO TRADE: " + "; ".join(system.get("readiness_issues") or []))
+    unreviewed = system.get("unreviewed_thresholds") or {}
+    if unreviewed:
+        st.warning("risk thresholds not yet reviewed by the operator: "
+                   + "; ".join(f"{k} = {v}" for k, v in unreviewed.items()))
     breakers = system.get("circuit_breakers") or {}
     lines = []
     if breakers.get("session_pause"):

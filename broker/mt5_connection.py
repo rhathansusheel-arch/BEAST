@@ -133,6 +133,25 @@ class SymbolSpec:
         )
 
 
+#: ``instruments.gold`` key -> :class:`SymbolSpec` attribute. What startup
+#: discovery fills from the venue (D-56) and therefore what preflight may
+#: excuse from the blocker list when the symbol resolves. ``account_currency``
+#: is deliberately absent: it is the operator's declaration of the currency
+#: ``risk.capital`` is stated in (D-58), and no venue can supply that.
+GOLD_SPEC_FIELDS = {
+    "symbol": "name",
+    "contract_multiplier": "contract_size",
+    "tick_size": "tick_size",
+    "tick_value": "tick_value",
+    "point": "point",
+    "volume_min": "volume_min",
+    "volume_step": "volume_step",
+    "volume_max": "volume_max",
+    "stops_level_points": "stops_level",
+    "filling_mode": "filling_mask",
+}
+
+
 @dataclass
 class SessionFacts:
     """What the handshake established. Rebuilt on every reconnect."""
@@ -181,6 +200,10 @@ class MT5Connection:
         self._worker_poisoned = False
         self._state_lock = threading.Lock()
         self._consecutive_failures = 0
+        #: True after a connect failed for a reason waiting cannot fix (missing
+        #: credentials, wrong account kind). The adapter's reconnect loop reads
+        #: it to back off to its ceiling at once instead of hammering a dead login.
+        self.misconfigured = False
 
     # -- config helpers ------------------------------------------------------
 
@@ -360,11 +383,13 @@ class MT5Connection:
                     self._open_client()
                     self._initialise()
                 self.handshake()
+                self.misconfigured = False
                 self._set_state(ConnectionState.READY, "handshake complete")
                 return True
             except (BridgeMisconfigured, AccountModeViolation) as error:
                 # Neither a missing credential nor the wrong kind of account
                 # becomes correct by waiting. Fail now, loudly.
+                self.misconfigured = True
                 self._set_state(ConnectionState.HALTED, str(error))
                 return False
             except BridgeError as error:
@@ -755,8 +780,14 @@ class MT5Connection:
             return False
         return True
 
-    def reconnect(self) -> bool:
+    def reconnect(self, wait_seconds: float | None = None) -> bool:
         """Tear down and rebuild, then re-run the handshake.
+
+        Args:
+            wait_seconds: Retry window handed to :meth:`connect`. The adapter's
+                in-loop reconnect passes ``0`` - one attempt per backoff step -
+                because a connect that retries for three minutes inside the
+                trading loop is three minutes in which no stop is evaluated.
 
         The caller must reconcile broker positions against Beast's state before
         returning to normal operation - this method restores the pipe, not the
@@ -769,4 +800,4 @@ class MT5Connection:
             logger.warning("MT5 disconnect during reconnect raised: %s", error)
         self._client = None if not self._injected else self._client
         self.facts = SessionFacts()
-        return self.connect()
+        return self.connect(wait_seconds=wait_seconds)

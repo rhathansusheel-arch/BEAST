@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from datetime import date, datetime
 from typing import Any
 
@@ -131,6 +132,11 @@ class MT5Adapter(BrokerClient):
             config=self.cfg,
         )
         self._bars: dict[tuple[str, str], pd.DataFrame] = {}
+        # Reconnect backoff (D-80). Monotonic seconds, so a host clock step
+        # cannot turn one attempt into a burst.
+        self._reconnect_delay = 0.0
+        self._reconnect_at = 0.0
+        self._reconnect_attempts = 0
 
     # -- session -------------------------------------------------------------
 
@@ -142,6 +148,72 @@ class MT5Adapter(BrokerClient):
 
     def disconnect(self) -> None:
         self.link.disconnect()
+
+    def maintain(self, clock=None) -> bool:
+        """Reconnect a dropped bridge, once per backoff step. Called every cycle.
+
+        The connection layer escalates a failing bridge to ``HALTED`` and stops
+        there: nothing in it tries again, because it cannot know whether the
+        caller can afford the wait. This is the caller-side loop (D-80). Each
+        attempt is one ``reconnect(wait_seconds=0)`` - a single handshake,
+        bounded by the ``connect`` timeout class - and the gap between attempts
+        doubles from ``retry.reconnect_base_seconds`` to
+        ``retry.reconnect_max_seconds``. A misconfigured login (``-6``, wrong
+        account kind) jumps straight to the ceiling: a dead password does not
+        come back to life by being asked every five seconds.
+
+        Args:
+            clock: Monotonic clock, injected by tests. Defaults to
+                :func:`time.monotonic`.
+
+        Returns:
+            True when the adapter is connected after this call - whether it
+            already was, or this call brought it back.
+        """
+        now = clock() if clock is not None else time.monotonic()
+        if self.is_connected():
+            if self._reconnect_attempts:
+                logger.info("MT5 bridge back after %d reconnect attempt(s)",
+                            self._reconnect_attempts)
+            self._reconnect_delay = 0.0
+            self._reconnect_attempts = 0
+            return True
+        if self.link.state is ConnectionState.CONNECTING:
+            return False
+
+        base = float(self.cfg.get("broker.mt5.retry.reconnect_base_seconds", 5))
+        ceiling = float(self.cfg.get("broker.mt5.retry.reconnect_max_seconds", 300))
+        if self._reconnect_delay == 0.0:
+            # First sight of the drop: schedule, do not act. The cycle that
+            # noticed the drop has an exit path to run first.
+            self._reconnect_delay = ceiling if self.link.misconfigured else base
+            self._reconnect_at = now + self._reconnect_delay
+            logger.warning("MT5 bridge is %s; first reconnect attempt in %.0fs",
+                           self.link.state.value, self._reconnect_delay)
+            return False
+        if now < self._reconnect_at:
+            return False
+
+        self._reconnect_attempts += 1
+        logger.warning("MT5 reconnect attempt %d", self._reconnect_attempts)
+        try:
+            ok = self.link.reconnect(wait_seconds=0.0)
+        except Exception as error:      # the loop must survive anything the bridge throws
+            logger.error("MT5 reconnect attempt %d raised: %s", self._reconnect_attempts, error)
+            ok = False
+        if ok and self.is_connected():
+            self._bars.clear()          # the merge cache may straddle the gap
+            logger.warning("MT5 bridge reconnected after %d attempt(s)", self._reconnect_attempts)
+            self._reconnect_delay = 0.0
+            self._reconnect_attempts = 0
+            return True
+
+        self._reconnect_delay = ceiling if self.link.misconfigured else min(
+            max(base, self._reconnect_delay * 2.0), ceiling)
+        self._reconnect_at = now + self._reconnect_delay
+        logger.warning("MT5 reconnect attempt %d failed; next in %.0fs",
+                       self._reconnect_attempts, self._reconnect_delay)
+        return False
 
     def capital(self) -> float | None:
         """Account equity, for sizing. None when the bridge cannot answer."""

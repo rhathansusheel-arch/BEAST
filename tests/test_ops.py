@@ -37,6 +37,7 @@ def ops_cfg(cfg, tmp_path, **over):
         "heartbeat_stale_seconds": 90, "max_restarts": 3, "restart_window_minutes": 30,
         "beast_unit": "beast.service", "dashboard_url": "http://127.0.0.1:1/",
         "max_clock_drift_seconds": 5, "min_free_disk_mb": 100,
+        "gold_specs_cache_path": None,
     }
     cfg.data["ops"].update(over)
     return cfg
@@ -88,6 +89,9 @@ def bare_runner(cfg, tmp_path):
     runner._last_cycle_ms = 0.0; runner._heartbeat_write_ms = 0.0
     runner._heartbeat_failures = 0; runner._heartbeat_warned_at = None
     runner._error_streak = 0
+    runner._broker_connected = {}; runner._announced_blockers = None
+    runner._gold_specs_from_broker = None; runner._gold_specs_read_at = None
+    runner._spread_calibrator = None; runner._auto_thresholds = {}
     runner._loop_interval = lambda: 5.0
     runner.logger = logging.getLogger("t")
     runner._maybe_periodic_snapshot = lambda now: None

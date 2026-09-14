@@ -232,35 +232,56 @@ class Config:
 
     # -- validation -----------------------------------------------------------
 
-    def unset_blockers(self) -> list[str]:
+    #: Every blocker key, and which market it gates. A key gates a market when
+    #: the market's instrument key or family appears in its scope.
+    BLOCKER_SCOPE = {
+        "instruments.nifty.lot_size": ("nifty",),
+        "instruments.nifty.strike_interval": ("nifty",),
+        "instruments.sensex.lot_size": ("sensex",),
+        "instruments.sensex.strike_interval": ("sensex",),
+        "instruments.gold.venue": ("gold",),
+        "instruments.gold.symbol": ("gold",),
+        "instruments.gold.contract_multiplier": ("gold",),
+        "instruments.gold.tick_size": ("gold",),
+        "instruments.gold.tick_value": ("gold",),
+        "instruments.gold.point": ("gold",),
+        "instruments.gold.volume_min": ("gold",),
+        "instruments.gold.volume_step": ("gold",),
+        "instruments.gold.volume_max": ("gold",),
+        "instruments.gold.stops_level_points": ("gold",),
+        "instruments.gold.account_currency": ("gold",),
+        "options.min_oi": ("indian",),
+        "options.min_volume": ("indian",),
+        "options.min_premium": ("indian",),
+        "data.gold_spread_max": ("gold",),
+    }
+
+    def unset_blockers(self, markets: list[str] | None = None) -> list[str]:
         """Return the dotted keys that are still ``null``.
 
-        Used by ``main.py`` at startup and by the dashboard header so the
-        operator can see exactly which instruments Beast will refuse to trade
-        and why, instead of discovering it as a silent absence of signals.
+        Args:
+            markets: When given, only keys that gate one of these markets are
+                returned. An agent configured for XAUUSD alone is not blocked
+                by an unset Nifty lot size, and must not be told it is (D-79).
+                When omitted, every watched key is checked - the whole-config
+                view ``--check`` prints.
+
+        Used by ``main.py`` at startup and by the dashboard so the operator
+        sees exactly which instruments Beast will refuse to trade and why,
+        instead of discovering it as a silent absence of signals.
         """
-        watched = [
-            "instruments.nifty.lot_size",
-            "instruments.nifty.strike_interval",
-            "instruments.sensex.lot_size",
-            "instruments.sensex.strike_interval",
-            "instruments.gold.venue",
-            "instruments.gold.symbol",
-            "instruments.gold.contract_multiplier",
-            "instruments.gold.tick_size",
-            "instruments.gold.tick_value",
-            "instruments.gold.point",
-            "instruments.gold.volume_min",
-            "instruments.gold.volume_step",
-            "instruments.gold.volume_max",
-            "instruments.gold.stops_level_points",
-            "instruments.gold.account_currency",
-            "options.min_oi",
-            "options.min_volume",
-            "options.min_premium",
-            "data.gold_spread_max",
+        if markets is None:
+            wanted = None
+        else:
+            wanted = set()
+            for market in markets:
+                wanted.add(self.instrument_key(market))
+                wanted.add(self.market_family(market))
+        return [
+            key for key, scope in self.BLOCKER_SCOPE.items()
+            if self.get(key, None) is None
+            and (wanted is None or any(tag in wanted for tag in scope))
         ]
-        return [key for key in watched if self.get(key, None) is None]
 
     def validate(self) -> list[str]:
         """Check internal consistency. Returns a list of human-readable problems.

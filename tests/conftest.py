@@ -48,6 +48,9 @@ def _fill_blockers(cfg: Config) -> Config:
     options = cfg.section("options")
     options.update({"min_oi": 100000, "min_volume": 50000, "min_premium": 5.0})
     cfg.section("data")["gold_spread_max"] = 0.60
+    # D-81: no test writes the operator's spec cache; the tests that cover the
+    # cache point this at a tmp_path of their own.
+    cfg.section("ops")["gold_specs_cache_path"] = None
     cfg.section("hmm")["enabled"] = False       # keep unit tests fast and offline
     cfg.section("ai")["enabled"] = False        # never call the API from tests
 

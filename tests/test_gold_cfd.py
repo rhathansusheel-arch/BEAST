@@ -76,6 +76,36 @@ def cfd_config(cfg, **overrides):
     return cfg
 
 
+class RecordingAlerts:
+    """Just the alert methods _fill_gold_specs may call, each recording its args."""
+
+    def __init__(self):
+        self.drifts, self.unresolved, self.blockers, self.sent = [], [], [], []
+
+    def spec_drift(self, market, changes): self.drifts.append((market, changes))
+    def symbol_unresolved(self, market, detail): self.unresolved.append((market, detail))
+    def config_blocker(self, keys): self.blockers.append(list(keys))
+    def circuit_breaker(self, *a, **k): self.sent.append(("circuit_breaker", a))
+    def send(self, *a, **k): self.sent.append(("send", a))
+
+
+def spec_runner(cfg, mt5):
+    """A BeastRunner with just enough state for _fill_gold_specs."""
+    import logging
+    from main import BeastRunner
+    runner = BeastRunner.__new__(BeastRunner)
+    runner.cfg = cfg
+    runner.brokers = {"mt5": mt5}
+    runner.markets = ["XAUUSD"]
+    runner.risk = RiskManager(cfg, capital=10_000)
+    runner.alerts = RecordingAlerts()
+    runner.logger = logging.getLogger("test")
+    runner._entry_pause_reason = {}
+    runner._gold_specs_from_broker = None
+    runner._gold_specs_read_at = None
+    return runner
+
+
 # -- 1. fail-closed survives ---------------------------------------------------
 
 def test_null_specs_still_reject_at_g8(raw_config):
@@ -191,14 +221,7 @@ def test_broker_read_never_overwrites_a_set_value(cfg):
                                                  currency="USD"))
     mt5 = SimpleNamespace(is_connected=lambda: True, link=link)
 
-    runner = BeastRunner.__new__(BeastRunner)
-    runner.cfg = cfg
-    runner.brokers = {"mt5": mt5}
-    runner.markets = ["XAUUSD"]
-    runner.risk = RiskManager(cfg, capital=10_000)
-    runner.alerts = SimpleNamespace(circuit_breaker=lambda *a, **k: None)
-    import logging
-    runner.logger = logging.getLogger("test")
+    runner = spec_runner(cfg, mt5)
 
     runner._fill_gold_specs()
 
@@ -219,19 +242,17 @@ def test_changed_broker_spec_is_not_applied(cfg):
     state = {"spec": first}
     link = SimpleNamespace(spec=lambda market: state["spec"],
                            facts=SimpleNamespace(company="X", server="Y", currency="USD"))
-    tripped = []
-    runner = BeastRunner.__new__(BeastRunner)
-    runner.cfg = cfg; runner.brokers = {"mt5": SimpleNamespace(is_connected=lambda: True, link=link)}
-    runner.markets = ["XAUUSD"]; runner.risk = RiskManager(cfg, capital=10_000)
-    runner.alerts = SimpleNamespace(circuit_breaker=lambda *a, **k: tripped.append(a))
-    runner.logger = logging.getLogger("test")
+    runner = spec_runner(cfg, SimpleNamespace(is_connected=lambda: True, link=link))
 
     runner._fill_gold_specs()
     state["spec"] = second
     runner._fill_gold_specs()
 
     assert section["volume_min"] == 0.01, "a changed broker value must not be applied"
-    assert tripped, "and the operator must be alerted"
+    assert runner.alerts.drifts == [("XAUUSD", {"volume_min": (0.01, 0.1)})], \
+        "and the operator must be alerted with the exact change"
+    assert runner._entry_pause_reason["XAUUSD"].startswith("SPEC_DRIFT"), \
+        "and entries on the market must pause - sizing on unverified specs is the risk"
 
 
 # -- 5. currency mismatch blocks gold ------------------------------------------

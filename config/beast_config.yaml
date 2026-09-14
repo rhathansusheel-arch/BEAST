@@ -91,6 +91,9 @@ broker:
       failures_before_halt: 3     # then HALTED: no new entries, exits keep running
     retry:
       max_attempts: 3             # only ever on requote / price-changed
+      reconnect_base_seconds: 5   # CONFIRM - D-80: first in-loop reconnect attempt after a drop
+      reconnect_max_seconds: 300  # CONFIRM - D-80: backoff ceiling (doubles up to this); a
+                                  #   misconfigured login (-6) waits this long between tries
     refresh_bars: 5               # bars pulled per cycle after the first full fetch
     deviation_points: 20          # max slippage tolerated on a market order
     comment_limit: 31             # broker comment length; half the reconcile key
@@ -414,6 +417,14 @@ risk:
   vol_factor_floor: 0.5           # CONFIRM - vol_factor clamps to [floor, 1.0]; shrinks only
   vol_atr_median_days: 20
   nifty_sensex_correlated: true   # CONFIRM (open item 13)
+  # D-82: liquidity/quality floors that were filled with a PLACEHOLDER rather
+  # than a reviewed number. Beast lists them in the boot banner and the
+  # THRESHOLDS_UNREVIEWED alert, and refuses `mode: live` while one gates an
+  # active market. Remove a key here once its value has been reviewed.
+  # (options.min_oi / min_volume / min_premium stay null: the Indian leg is not
+  # an active market - Beast is XAUUSD-only - so they neither block nor need a
+  # placeholder. Add them here if they are ever filled with placeholders.)
+  unreviewed_thresholds: []
 
 # ------------------------------------------------------------------------------
 # data  (soul file 4.6)
@@ -428,6 +439,15 @@ data:
                                   #   core/signal_generator.py. Set it from the p90 of the
                                   #   spread sample scripts/mt5_symbol_specs.py prints, and
                                   #   record the hours the sample covered next to the value.
+                                  #   D-82: while null AND gold_spread_auto_calibrate is on,
+                                  #   Beast samples the live book after connecting and uses
+                                  #   p90 x gold_spread_safety_multiplier for the session,
+                                  #   listed as UNREVIEWED in the boot banner. A number here
+                                  #   always wins and ends the auto mode.
+  gold_spread_auto_calibrate: true        # CONFIRM - D-82: RISK-TOLERANCE STAND-IN, not a fact
+  gold_spread_calibration_seconds: 60     # CONFIRM - burn-in window, sampled a burst per cycle
+  gold_spread_calibration_burst: 5        # CONFIRM - quotes per cycle during the burn-in
+  gold_spread_safety_multiplier: 2.5      # CONFIRM - the brief's 2-3x; ceiling = p90 x this
   gold_spread_max_mode: absolute  # absolute | atr_multiple
   gap_recompute_atr: 1.0          # CONFIRM
   history_bars: 1500              # bars held in memory per timeframe
@@ -503,6 +523,14 @@ ops:
   dashboard_url: http://127.0.0.1:8501/_stcore/health   # CONFIRM
   max_clock_drift_seconds: 5         # CONFIRM - preflight refuses beyond this vs MT5 server time
   min_free_disk_mb: 2048             # CONFIRM - 4 streams x 10 MB x 30 backups ~ 1.2 GB + journal
+  api_lost_reminder_minutes: 15      # CONFIRM - D-80: API_LOST pages once on the drop, then
+                                     #   again every this-many minutes while still down
+  gold_specs_cache_path: ./logs/gold_specs_cache.json   # CONFIRM - D-81: last-validated MT5
+                                     #   specs, keyed by login+server. A value that differs
+                                     #   at the next read is SPEC_DRIFT: alerted, NOT applied.
+                                     #   Empty/null disables the file (in-session compare only).
+  gold_specs_revalidate_hours: 24    # CONFIRM - D-81: re-read the venue this often, and on
+                                     #   every reconnect
 
 # ------------------------------------------------------------------------------
 # ai - Claude narration / review layer

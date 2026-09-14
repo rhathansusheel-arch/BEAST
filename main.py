@@ -58,12 +58,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 from broker import BrokerClient
 from broker.order_executor import OrderExecutor
 from broker.mt5_adapter import MT5Adapter
+from broker.mt5_connection import GOLD_SPEC_FIELDS
 from broker.paper_broker import PaperBroker
 from broker.position_tracker import PositionTracker
 from broker.retry import RetryPolicy, try_call
 from broker.zerodha_client import ZerodhaClient
 from core.ai_analyst import AIAnalyst
-from core.config import Config, describe_unset, get_config
+from core.config import Config, ConfigError, describe_unset, get_config
 from core.reconcile import reconcile
 from core.learning import PerformanceTracker
 from core.override import OverrideGuard
@@ -86,6 +87,7 @@ from core.session_state import (
 from core.signal_generator import SignalGenerator
 from data.feature_engineering import parse_timeframe
 from data.market_data import MarketDataService
+from data.spread_calibration import SpreadCalibrator
 from ops import EXIT_CLEAN, EXIT_CRASH, EXIT_DELIBERATE_HALT, EXIT_KILL, EXIT_STARTUP_FAILURE
 from ops.heartbeat import SCHEMA_VERSION, age_seconds, read_live_state, write_json_atomic
 from ops.killswitch import read_flag
@@ -171,11 +173,7 @@ class BeastRunner:
         self.markets: list[str] = [
             market.upper() for market in self.cfg.get("broker.symbols")
         ]
-        self.brokers: dict[str, BrokerClient] = {
-            "zerodha": ZerodhaClient(self.cfg),
-            "paper": PaperBroker(self.cfg),
-            "mt5": MT5Adapter(self.cfg),
-        }
+        self.brokers: dict[str, BrokerClient] = self._build_brokers()
 
         self.journal = Journal(self.cfg)
         self.alerts = AlertManager(self.cfg)
@@ -218,6 +216,12 @@ class BeastRunner:
         self._flicker_announced: dict[str, bool] = {}
         self._breaker_announced: dict[str, str] = {}
         self._broker_connected: dict[str, bool] = {}
+        self._broker_down_since: dict[str, datetime] = {}
+        self._announced_blockers: list[str] | None = None
+        self._gold_specs_from_broker: dict | None = None
+        self._gold_specs_read_at: datetime | None = None
+        self._spread_calibrator = None
+        self._auto_thresholds: dict[str, str] = {}
         self._pnl_band: dict[str, int] = {}
         self._feed_failures: dict[str, int] = {m: 0 for m in self.markets}
         self._entry_pause_reason: dict[str, str] = {}
@@ -279,19 +283,114 @@ class BeastRunner:
 
     # -- 1. config -----------------------------------------------------------
 
+    #: Adapter constructors by routing name. Only the ones an active market
+    #: routes to are built, so an XAUUSD-only agent never instantiates, connects
+    #: or complains about the Zerodha leg (D-79).
+    ADAPTERS = {
+        "zerodha": ZerodhaClient,
+        "paper": PaperBroker,
+        "mt5": MT5Adapter,
+    }
+
+    def _build_brokers(self) -> dict[str, BrokerClient]:
+        routing = {str(k).upper(): str(v) for k, v in self.cfg.get("broker.routing").items()}
+        needed: list[str] = []
+        for market in self.markets:
+            name = routing.get(market)
+            if name is None:
+                raise ConfigError(f"broker.routing has no entry for active market {market}")
+            if name not in self.ADAPTERS:
+                raise ConfigError(f"broker.routing sends {market} to unknown adapter {name!r}")
+            if name not in needed:
+                needed.append(name)
+        # The simulator is always present: paper-mode exits and tests route to it.
+        if "paper" not in needed:
+            needed.append("paper")
+        return {name: self.ADAPTERS[name](self.cfg) for name in needed}
+
     def _step_config(self) -> bool:
-        """Validate the config. A consistency error stops startup; a blocker does not."""
+        """Validate the config. A consistency error stops startup; a blocker does not.
+
+        Blockers are *listed* here and *alerted* after the brokers have had
+        their chance to fill them (:meth:`_report_blockers`). Alerting before
+        that paged the operator about gold specs the venue supplies thirty
+        seconds later, which is how a startup that was working read as broken.
+        """
         problems = self.cfg.validate()
         if problems:
             for problem in problems:
                 self.logger.error("CONFIG: %s", problem)
             return False
 
-        blockers = self.cfg.unset_blockers()
+        self.logger.info("active markets: %s (adapters: %s)",
+                         ", ".join(self.markets), ", ".join(self.brokers))
+        # Only the keys that gate an ACTIVE market can block trades; the rest
+        # are reported by --check for the whole config, not alerted here.
+        blockers = self.cfg.unset_blockers(self.markets)
         if blockers:
-            self.logger.warning(describe_unset(blockers))
-            self.alerts.config_blocker(blockers)
+            self.logger.info("unset before broker discovery: %s", ", ".join(blockers))
+        unreviewed = self.unreviewed_thresholds()
+        if unreviewed and not self.cfg.is_paper:
+            # D-82: a placeholder floor is a paper-trading convenience. Going
+            # live with one is exactly the drift the banner exists to prevent,
+            # so it is refused here rather than merely announced.
+            for key, how in unreviewed.items():
+                self.logger.error("CONFIG: %s is %s - set it explicitly before going live", key, how)
+            return False
         return True
+
+    def _report_blockers(self) -> list[str]:
+        """Alert on the blockers that remain once discovery has run - on change only.
+
+        Returns the current list. Re-run after every reconnect fill, so a
+        blocker that discovery clears mid-session is not still on the board,
+        and one that appears (a symbol that vanished) is.
+        """
+        blockers = self.cfg.unset_blockers(self.markets)
+        previous = getattr(self, "_announced_blockers", None)
+        if blockers != previous:
+            if blockers:
+                self.logger.warning(describe_unset(blockers))
+                self.alerts.config_blocker(blockers)
+            elif previous:
+                self.logger.info("config blockers cleared: %s", ", ".join(previous))
+            self._announced_blockers = list(blockers)
+        return blockers
+
+    #: Risk floors that are the operator's tolerance, not a fact any venue can
+    #: supply (D-82), and the market family each one gates.
+    REVIEWED_THRESHOLDS = {
+        "options.min_oi": ("indian",),
+        "options.min_volume": ("indian",),
+        "options.min_premium": ("indian",),
+        "data.gold_spread_max": ("gold",),
+    }
+
+    def unreviewed_thresholds(self) -> dict[str, str]:
+        """Which active-market risk floors are not explicitly operator-set, and why.
+
+        A floor counts as unreviewed when it is still ``null`` and will be
+        auto-calibrated (``data.gold_spread_max``), when it was auto-calibrated
+        this session, or when the operator listed it under
+        ``risk.unreviewed_thresholds`` to mark a placeholder. The result feeds
+        the boot banner, the ``THRESHOLDS_UNREVIEWED`` alert and the live-mode
+        refusal in :meth:`_step_config`.
+        """
+        families = {self.cfg.market_family(m) for m in self.markets}
+        marked = {str(k) for k in (self.cfg.get("risk.unreviewed_thresholds", None) or [])}
+        auto = getattr(self, "_auto_thresholds", {})
+        out: dict[str, str] = {}
+        for key, scope in self.REVIEWED_THRESHOLDS.items():
+            if not any(f in families for f in scope):
+                continue
+            if key in auto:
+                out[key] = auto[key]
+            elif key == "data.gold_spread_max" and self.cfg.get(key, None) is None \
+                    and bool(self.cfg.get("data.gold_spread_auto_calibrate", False)):
+                out[key] = "AUTO-CALIBRATING (unset; p90 of the live spread x safety multiplier)"
+            elif key in marked:
+                out[key] = f"PLACEHOLDER ({self.cfg.get(key, None)})"
+        return out
 
     # -- 2. brokers ----------------------------------------------------------
 
@@ -319,6 +418,7 @@ class BeastRunner:
                     "could not connect: %s - trades routed to it will be refused", name
                 )
         self._fill_contract_specs()
+        self._report_blockers()
 
     def _fill_contract_specs(self) -> None:
         """Read contract specs from the broker (open items 17 and 18).
@@ -353,33 +453,90 @@ class BeastRunner:
                         key, field_name, specs[field_name],
                     )
 
-    #: instruments.gold key -> attribute of broker.mt5_connection.SymbolSpec
-    GOLD_SPEC_FIELDS = {
-        "symbol": "name",
-        "contract_multiplier": "contract_size",
-        "tick_size": "tick_size",
-        "tick_value": "tick_value",
-        "point": "point",
-        "volume_min": "volume_min",
-        "volume_step": "volume_step",
-        "volume_max": "volume_max",
-        "stops_level_points": "stops_level",
-        "filling_mode": "filling_mask",
-    }
+    #: instruments.gold key -> attribute of broker.mt5_connection.SymbolSpec.
+    #: Shared with ops/preflight.py, which must know what discovery will fill.
+    GOLD_SPEC_FIELDS = GOLD_SPEC_FIELDS
+
+    #: Gold-spec cache file layout version (D-81).
+    GOLD_SPEC_CACHE_SCHEMA = 1
+
+    def _gold_market(self) -> str | None:
+        return next((m for m in self.markets if self.cfg.market_family(m) == "gold"), None)
+
+    def _gold_spec_cache_path(self) -> Path | None:
+        """Where the last-validated gold specs live, or ``None`` when caching is off."""
+        raw = self.cfg.get("ops.gold_specs_cache_path", "./logs/gold_specs_cache.json")
+        if not raw:
+            return None
+        path = Path(str(raw))
+        return path if path.is_absolute() else PROJECT_ROOT / path
+
+    def _load_gold_spec_cache(self, facts) -> dict | None:
+        """The cached specs for *this* account, or ``None``.
+
+        Keyed by login and server: a different account on the same broker can
+        legitimately carry different specs (raw vs standard), and a new demo
+        login must not be told its specs "drifted" from an old one's.
+        """
+        path = self._gold_spec_cache_path()
+        if path is None or not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            self.logger.warning("gold spec cache %s is unreadable (%s); ignored", path, error)
+            return None
+        if not isinstance(data, dict) or data.get("schema") != self.GOLD_SPEC_CACHE_SCHEMA:
+            self.logger.warning("gold spec cache %s has an unknown layout; ignored", path)
+            return None
+        login = int(getattr(facts, "login", 0) or 0)
+        server = str(getattr(facts, "server", "") or "")
+        if (int(data.get("login", 0) or 0), str(data.get("server", ""))) != (login, server):
+            self.logger.info(
+                "gold spec cache is for account %s on %s, not %s on %s; ignored",
+                data.get("login"), data.get("server"), login, server,
+            )
+            return None
+        return data
+
+    def _save_gold_spec_cache(self, read: dict, facts) -> None:
+        path = self._gold_spec_cache_path()
+        if path is None:
+            return
+        try:
+            write_json_atomic(path, {
+                "schema": self.GOLD_SPEC_CACHE_SCHEMA,
+                "login": int(getattr(facts, "login", 0) or 0),
+                "server": str(getattr(facts, "server", "") or ""),
+                "company": str(getattr(facts, "company", "") or ""),
+                "currency": str(getattr(facts, "currency", "") or ""),
+                "read_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "specs": read,
+            })
+        except OSError as error:
+            self.logger.warning("could not write the gold spec cache %s: %s", path, error)
 
     def _fill_gold_specs(self) -> None:
-        """Populate ``instruments.gold`` from the live MT5 symbol (D-56).
+        """Populate ``instruments.gold`` from the live MT5 symbol (D-56, D-81).
 
         Every value is logged with its source so a fill that looks wrong later
-        can be traced in one line. On a reconnect the broker's numbers are
-        compared with what was read before; a change is logged as an error and
-        **not** applied, because a symbol that was silently resized between
-        sessions is exactly what an operator must be told about.
+        can be traced in one line. The broker's numbers are compared with what
+        was read before - earlier this session, or by the last session through
+        ``ops.gold_specs_cache_path`` - and a change is alerted as
+        ``SPEC_DRIFT``, logged as an error and **not** applied: a symbol that
+        was silently resized between sessions is exactly what an operator must
+        be told about, because sizing would silently change with it. Entries
+        on the market are paused until a restart, once the new values have been
+        confirmed at the venue and the cache removed.
+
+        A venue that is connected but has no usable symbol is its own alert,
+        ``SYMBOL_UNRESOLVED``, never a flavour of ``API_LOST``: the bridge is
+        fine, the symbol name is not.
         """
         mt5 = self.brokers.get("mt5")
         if mt5 is None or not mt5.is_connected():
             return
-        gold = next((m for m in self.markets if self.cfg.market_family(m) == "gold"), None)
+        gold = self._gold_market()
         if gold is None:
             return
         key = self.cfg.instrument_key(gold)
@@ -392,35 +549,64 @@ class BeastRunner:
 
         spec = mt5.link.spec(gold)
         facts = mt5.link.facts
+        venue = f"{getattr(facts, 'company', '')} / {getattr(facts, 'server', '')}".strip(" /")
         if spec is None:
-            self.logger.error("%s: MT5 is connected but has no symbol for %s; specs stay unset",
-                              key, gold)
+            configured = self.cfg.get(
+                f"broker.mt5.profiles.{self.cfg.get('broker.mt5.active_profile', 'gold')}"
+                f".symbols.{gold}", "")
+            detail = (
+                f"MT5 is connected ({venue or 'venue unknown'}) but has no usable symbol for "
+                f"{gold}" + (f" (configured name {configured!r} not found)" if configured
+                             else " (discovery tried *XAU* and *GOLD*)")
+            )
+            self.logger.error("%s: %s; specs stay unset", key, detail)
+            self.alerts.symbol_unresolved(gold, detail)
             return
 
         read: dict[str, object] = {
             name: getattr(spec, attr) for name, attr in self.GOLD_SPEC_FIELDS.items()
         }
-        if facts.company or facts.server:
-            read["venue"] = f"{facts.company} / {facts.server}".strip(" /")
+        if venue:
+            read["venue"] = venue
 
         previous = getattr(self, "_gold_specs_from_broker", None)
-        if previous is not None:
-            changed = {k: (previous[k], v) for k, v in read.items()
-                       if k in previous and previous[k] != v}
+        baseline = "earlier this session"
+        if previous is None:
+            cache = self._load_gold_spec_cache(facts)
+            if cache is not None:
+                previous = dict(cache.get("specs") or {})
+                baseline = f"the cache written {cache.get('read_at')}"
+        changed = {k: (previous[k], v) for k, v in read.items()
+                   if previous is not None and k in previous and previous[k] != v} \
+            if previous is not None else {}
+        if changed:
             for name, (old, new) in changed.items():
                 self.logger.error(
-                    "%s.%s CHANGED at the broker between sessions: %s -> %s. Not applied; "
-                    "restart Beast after confirming the new value.", key, name, old, new,
+                    "%s.%s CHANGED at the broker since %s: %s -> %s. NOT applied.",
+                    key, name, baseline, old, new,
                 )
-            if changed:
-                self.alerts.circuit_breaker(gold, "broker changed the gold contract specs",
-                                            tripped=True)
+            self.logger.error(
+                "%s: confirm the new contract specs at the venue, then delete %s and restart "
+                "Beast to accept them. Entries on %s are paused until then.",
+                key, self._gold_spec_cache_path() or "(no cache file)", gold,
+            )
+            self.alerts.spec_drift(gold, changed)
+            self._entry_pause_reason[gold] = (
+                "SPEC_DRIFT: " + "; ".join(f"{k} {o} -> {n}" for k, (o, n) in changed.items()))
             return
+        if previous is not None:
+            self.logger.info("gold specs unchanged against %s", baseline)
+            if self._entry_pause_reason.get(gold, "").startswith("SPEC_DRIFT"):
+                del self._entry_pause_reason[gold]
+        first_fill = getattr(self, "_gold_specs_read_at", None) is None
         self._gold_specs_from_broker = read
+        self._gold_specs_read_at = datetime.now()
+        self._save_gold_spec_cache(read, facts)
 
         for name, value in read.items():
             if section.get(name) is not None:
-                self.logger.info("gold.%s = %s (config)", name, section[name])
+                if first_fill:
+                    self.logger.info("gold.%s = %s (config)", name, section[name])
                 continue
             if value in (None, "", 0, 0.0):
                 self.logger.warning("gold.%s: broker reported %r; left unset", name, value)
@@ -648,11 +834,18 @@ class BeastRunner:
         )
         self._reconcile_report = report
         self._broker_positions = sorted({p.market for p in report.positions})
+        self._apply_reconcile(report, now, label="startup reconcile")
 
+    def _apply_reconcile(self, report, now: datetime, label: str) -> None:
+        """Log a reconcile report and act on it - pauses and adoptions.
+
+        Shared by the startup sync and the post-reconnect sync (D-80), which
+        differ only in which markets they cover.
+        """
         level = self.logger.error if (report.repaired or report.disagreements
                                       or report.unreachable or report.safe_mode) \
             else self.logger.info
-        level("startup reconcile:")
+        level("%s:", label)
         for line in report.lines():
             level("  %s", line)
 
@@ -775,11 +968,28 @@ class BeastRunner:
                 self.cfg.risk_per_trade(market) * 100,
                 self.cfg.daily_loss_cap(market) * 100, version,
             )
-        blockers = self.cfg.unset_blockers()
+        blockers = self.cfg.unset_blockers(self.markets)
         if blockers:
             self.logger.warning("refusing affected trades - unset: %s", ", ".join(blockers))
+
+        # D-82: the one-time banner. Paper trading on a placeholder or an
+        # auto-calibrated floor is fine; forgetting that it is one is not.
+        unreviewed = self.unreviewed_thresholds()
+        if unreviewed:
+            self.logger.warning("RISK THRESHOLDS NOT YET REVIEWED BY THE OPERATOR:")
+            for key, how in unreviewed.items():
+                self.logger.warning("  %s = %s", key, how)
+            self.logger.warning(
+                "  paper trading proceeds on these; mode: live is refused until each is "
+                "set explicitly in config/beast_config.yaml")
+            self.alerts.thresholds_unreviewed(unreviewed)
+
+        issues = self._readiness_issues()
         self.logger.info("=" * 68)
-        self.logger.info("System online")
+        if issues:
+            self.logger.warning("System online - NOT READY TO TRADE: %s", "; ".join(issues))
+        else:
+            self.logger.info("System online - ready to trade")
 
     # =====================================================================
     # MAIN LOOP
@@ -883,7 +1093,10 @@ class BeastRunner:
             risk_state[market] = self.risk.headroom(market)
 
         self._check_circuit_breakers(now)
+        self._maintain_brokers(now)
         self._check_broker_sessions(now)
+        self._maybe_calibrate_spread(now)
+        self._maybe_revalidate_gold_specs(now)
         self._maybe_retrain(now)
         self._maybe_weekly_review(now)
         self._last_dashboard_state = dashboard_state
@@ -1132,6 +1345,7 @@ class BeastRunner:
             free_mb = shutil.disk_usage(log_dir if log_dir.exists() else PROJECT_ROOT).free / 2**20
         except OSError:
             free_mb = None
+        readiness = self._readiness_issues()
         system = {
             "brokers": [{"name": name, "connected": bool(b.is_connected()),
                          "state": (getattr(getattr(b, "link", None), "state", None).value
@@ -1139,6 +1353,9 @@ class BeastRunner:
                          "last_error": None}
                         for name, b in self.brokers.items()],
             "bridge_ok": bool(link is not None and link.state.value in ("READY", "DEGRADED")),
+            "ready": not readiness,
+            "readiness_issues": readiness,
+            "unreviewed_thresholds": self.unreviewed_thresholds(),
             "circuit_breakers": {
                 "session_pause": bool(paused),
                 "feed_pause": {m: r for m, r in self._entry_pause_reason.items()
@@ -1584,17 +1801,156 @@ class BeastRunner:
             self.cfg.market_family(market), realised, cap, fraction
         )
 
+    def _maintain_brokers(self, now: datetime) -> None:
+        """Drive each adapter's reconnect loop, and re-arm what a restore needs (D-80).
+
+        The adapter owns the backoff; this owns what must happen *after* the
+        pipe is back - contract specs re-validated, positions reconciled
+        against the venue, the blocker board refreshed. A restore that skipped
+        those would resume trading on a session whose facts nobody re-checked.
+        """
+        for name, broker in self.brokers.items():
+            maintain = getattr(broker, "maintain", None)
+            if maintain is None:
+                continue
+            was_connected = self._broker_connected.get(name)
+            try:
+                connected = bool(maintain())
+            except Exception as error:      # never let a broker take the loop down
+                self.logger.error("%s: reconnect maintenance raised: %s", name, error)
+                continue
+            if connected and was_connected is False:
+                self._after_broker_restored(name, now)
+
+    def _after_broker_restored(self, name: str, now: datetime) -> None:
+        """Re-validate and reconcile once ``name`` is reachable again."""
+        self.logger.warning("%s: session restored - re-validating specs and reconciling", name)
+        if name == "mt5":
+            self._fill_gold_specs()
+
+        routing = {str(k).upper(): str(v) for k, v in self.cfg.get("broker.routing").items()}
+        tracked = set(self.positions.open_markets())
+        # Positions Beast already manages in-process were protected by their
+        # resting stops through the gap; the exit path picks them up on this
+        # cycle. Only markets with nothing tracked are asked afresh.
+        untracked = [m for m in self.markets if routing.get(m) == name and m not in tracked]
+        if untracked:
+            report = reconcile(
+                self.brokers, self.positions, self.journal, self.risk, self.alerts,
+                self.cfg, now, markets=untracked,
+            )
+            self._reconcile_report = report
+            self._apply_reconcile(report, now, label=f"reconcile after {name} reconnect")
+            for market in untracked:
+                reason = self._entry_pause_reason.get(market, "")
+                if market not in report.entries_to_pause and reason.startswith("broker unreachable"):
+                    self.logger.info("%s: entry pause lifted - %s", market, reason)
+                    del self._entry_pause_reason[market]
+        self._report_blockers()
+
+    def _maybe_calibrate_spread(self, now: datetime) -> None:
+        """Auto-calibrate ``data.gold_spread_max`` from the live book (D-82).
+
+        Runs only while the ceiling is unset, calibration is enabled, the
+        gold adapter is up and the gold session is open - a closed book is
+        not a sample. An operator-set value is never touched.
+        """
+        gold = self._gold_market()
+        if gold is None or self.cfg.get("data.gold_spread_max", None) is not None:
+            return
+        if not bool(self.cfg.get("data.gold_spread_auto_calibrate", False)):
+            return
+        routing = {str(k).upper(): str(v) for k, v in self.cfg.get("broker.routing").items()}
+        broker = self.brokers.get(routing.get(gold, ""))
+        if broker is None or not broker.is_connected() or not self.clocks[gold].is_open(now):
+            return
+        if self._spread_calibrator is None:
+            self._spread_calibrator = SpreadCalibrator(
+                window_seconds=float(self.cfg.get("data.gold_spread_calibration_seconds", 60)),
+                multiplier=float(self.cfg.get("data.gold_spread_safety_multiplier", 2.5)),
+                burst=int(self.cfg.get("data.gold_spread_calibration_burst", 5)),
+            )
+        ceiling = self._spread_calibrator.sample(lambda: broker.quote(gold))
+        if ceiling is None:
+            return
+        self.cfg.section("data")["gold_spread_max"] = ceiling
+        how = self._spread_calibrator.describe()
+        self._auto_thresholds["data.gold_spread_max"] = how
+        self.alerts.send(
+            AlertKind.THRESHOLDS_UNREVIEWED, gold,
+            f"data.gold_spread_max {how}. Gold entries now permitted under this ceiling; "
+            f"review it and set an explicit value before anything goes near live capital.",
+            now, payload={"key": "data.gold_spread_max", "value": ceiling},
+        )
+
+    def _maybe_revalidate_gold_specs(self, now: datetime) -> None:
+        """Re-read the gold contract specs every ``ops.gold_specs_revalidate_hours`` (D-81)."""
+        hours = float(self.cfg.get("ops.gold_specs_revalidate_hours", 24) or 0)
+        read_at = self._gold_specs_read_at
+        if hours <= 0 or read_at is None or now - read_at < timedelta(hours=hours):
+            return
+        mt5 = self.brokers.get("mt5")
+        gold = self._gold_market()
+        if mt5 is None or gold is None or not mt5.is_connected():
+            return
+        self.logger.info("re-validating the gold contract specs against the venue (every %gh)",
+                         hours)
+        self._gold_specs_read_at = now          # one attempt per interval, success or not
+        specs = getattr(getattr(mt5.link, "facts", None), "specs", None)
+        if isinstance(specs, dict):
+            specs.pop(gold.upper(), None)       # force a fresh symbol_info
+        self._fill_gold_specs()
+        self._report_blockers()
+
+    def _readiness_issues(self) -> list[str]:
+        """Why Beast is *not* ready to trade right now - empty when it is.
+
+        "Running" and "ready" are different claims. The process can be up with
+        the bridge down and the specs unset; the banner, the heartbeat and the
+        dashboard all say so instead of reporting a green light.
+        """
+        issues: list[str] = []
+        for name, broker in self.brokers.items():
+            if name != "paper" and not broker.is_connected():
+                issues.append(f"{name} not connected")
+        blockers = self.cfg.unset_blockers(self.markets)
+        if blockers:
+            issues.append("unset: " + ", ".join(blockers))
+        for market, reason in sorted(self._entry_pause_reason.items()):
+            issues.append(f"{market} entries paused: {reason}")
+        return issues
+
     def _check_broker_sessions(self, now: datetime) -> None:
-        """Alert when a broker session drops or comes back."""
+        """Alert when a broker session drops or comes back - and while it stays down.
+
+        Edge-triggered, so a drop pages once; a session that is *still* down
+        pages again every ``ops.api_lost_reminder_minutes`` (D-80). Silence
+        after the first alert reads as "recovered" to an operator who was not
+        watching, and a bridge that has been down for an hour is new
+        information every fifteen minutes.
+        """
+        reminder = timedelta(minutes=float(self.cfg.get("ops.api_lost_reminder_minutes", 15)))
         for name, broker in self.brokers.items():
             connected = bool(broker.is_connected())
             previous = self._broker_connected.get(name)
             self._broker_connected[name] = connected
-            if previous is None or previous == connected:
+            if previous is None:
+                if not connected:
+                    self._broker_down_since[name] = now
+                continue
+            if previous == connected:
+                if not connected:
+                    since = self._broker_down_since.setdefault(name, now)
+                    if now - since >= reminder:
+                        self._broker_down_since[name] = now
+                        self.alerts.api_lost(
+                            name, f"still down after {int((now - since).total_seconds() // 60)} min")
                 continue
             if connected:
+                self._broker_down_since.pop(name, None)
                 self.alerts.api_restored(name, self._broker_latency(name))
             else:
+                self._broker_down_since[name] = now
                 self.alerts.api_lost(name)
 
     def _broker_latency(self, name: str) -> float | None:
@@ -1976,15 +2332,31 @@ def cmd_check(cfg: Config) -> int:
     else:
         print("\nconfig consistency: OK")
 
-    blockers = cfg.unset_blockers()
+    markets = [str(m).upper() for m in cfg.get("broker.symbols")]
+    blockers = cfg.unset_blockers(markets)
+    inactive = [k for k in cfg.unset_blockers() if k not in blockers]
     print()
     print(describe_unset(blockers))
     if blockers:
+        discovered = [k for k in blockers if k.startswith("instruments.gold.")
+                      and k != "instruments.gold.account_currency"
+                      and str(cfg.get("instruments.gold.trade", "")) == "cfd"
+                      and cfg.get("instruments.gold.prefer_broker_contract_master", True)]
+        if discovered:
+            print("\n  Read from the MT5 symbol at startup (D-56), so null here is expected:")
+            for key in discovered:
+                print(f"    - {key}")
+        if "data.gold_spread_max" in blockers and cfg.get("data.gold_spread_auto_calibrate", False):
+            print("\n  Auto-calibrated from the live book after connecting (D-82), and listed "
+                  "as UNREVIEWED\n  until you set it: data.gold_spread_max")
         print(
             "\nThese are not bugs. The soul file treats an unset threshold as FAILING, "
             "not passing, so the affected trades are refused at G8/G9 with a logged "
             "reason until real numbers are supplied (open items 15, 17, 18, 19)."
         )
+    if inactive:
+        print(f"\nUnset for markets NOT in broker.symbols (ignored while inactive, D-79): "
+              f"{', '.join(inactive)}")
     return 1 if problems else 0
 
 
