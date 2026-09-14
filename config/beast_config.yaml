@@ -525,6 +525,8 @@ ops:
   min_free_disk_mb: 2048             # CONFIRM - 4 streams x 10 MB x 30 backups ~ 1.2 GB + journal
   api_lost_reminder_minutes: 15      # CONFIRM - D-80: API_LOST pages once on the drop, then
                                      #   again every this-many minutes while still down
+  watchdog_reminder_minutes: 15      # CONFIRM - D-80: the watchdog's "exited deliberately" page
+                                     #   once per exit, then every this-many minutes
   gold_specs_cache_path: ./logs/gold_specs_cache.json   # CONFIRM - D-81: last-validated MT5
                                      #   specs, keyed by login+server. A value that differs
                                      #   at the next read is SPEC_DRIFT: alerted, NOT applied.

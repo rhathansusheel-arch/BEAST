@@ -146,12 +146,19 @@ def test_no_restart_through_a_kill_flag(cfg, tmp_path):
 
 @pytest.mark.parametrize("code", [EXIT_CLEAN, EXIT_STARTUP_FAILURE, EXIT_DELIBERATE_HALT, EXIT_KILL])
 def test_no_restart_on_deliberate_exit_codes(cfg, tmp_path, code):
-    wd, calls = watchdog(cfg, tmp_path, exit_code=code)
+    clock = {"t": T0}
+    wd, calls = watchdog(cfg, tmp_path, exit_code=code, now=lambda: clock["t"])
     write_heartbeat(wd.heartbeat_path, beat(age_s=3600))
     for _ in range(3):
         wd.check()
+        clock["t"] += timedelta(seconds=15)
     assert calls == []
-    assert any("deliberately" in m for _, _, m in wd.alerts.sent)
+    pages = [m for _, _, m in wd.alerts.sent if "deliberately" in m]
+    assert len(pages) == 1, "one page per deliberate exit, not one per 15-second pass"
+    clock["t"] += timedelta(minutes=15)
+    wd.check()
+    assert len([m for _, _, m in wd.alerts.sent if "deliberately" in m]) == 2, \
+        "and a reminder once the interval has passed"
 
 
 def test_crash_loop_guard_trips_and_pages(cfg, tmp_path):

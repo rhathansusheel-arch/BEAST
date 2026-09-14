@@ -81,6 +81,7 @@ class Watchdog:
         self.restarts: deque[datetime] = deque()
         self.crash_loop_tripped = False
         self._stale_seen_once = False
+        self._deliberate_seen: tuple[int, datetime] | None = None
         self.last_report: dict[str, Any] = {}
 
     # -- settings ------------------------------------------------------------
@@ -144,9 +145,18 @@ class Watchdog:
             return f"none: KILL flag ({flag.get('mode')})"
         code = self.exit_status(unit)
         if code is not None and code in NO_RESTART_CODES:
-            self._page("SYSTEM", f"Beast exited deliberately (code {code}); not restarting. "
-                                 f"Operator action needed.", critical=True)
+            # Once per exit, then a reminder - not once per 15-second pass. The
+            # 2026-09-14 log holds 125 identical pages for one preflight refusal;
+            # the operator learned nothing from the 124 after the first.
+            now = self.now()
+            reminder = timedelta(minutes=float(self._s("watchdog_reminder_minutes", 15)))
+            seen = self._deliberate_seen
+            if seen is None or seen[0] != code or now - seen[1] >= reminder:
+                self._deliberate_seen = (code, now)
+                self._page("SYSTEM", f"Beast exited deliberately (code {code}); not restarting. "
+                                     f"Operator action needed.", critical=True)
             return f"none: deliberate exit {code}"
+        self._deliberate_seen = None
         if self.crash_loop_tripped:
             return "none: crash-loop guard"
 
